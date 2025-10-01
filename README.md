@@ -1,2 +1,2 @@
 # pxr-reduce
-A collection of standalone tools for reducing polarized X-ray reflectivity data, specifically designed for use at the RSOXS beamline at the ALS.
+A collection of standalone tools for reducing polarized X-ray reflectivity collected at the RSOXS beamline at the ALS.
