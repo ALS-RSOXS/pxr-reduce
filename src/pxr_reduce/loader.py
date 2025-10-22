@@ -359,10 +359,11 @@ class PrsoxrLoader:
         # Theta
         if self.process_vars['sam_th_offset'] == None and self.process_vars['sam_th_correction']: # Was a sample theta offset given to the loader?
             #[data['sam_z'][np.abs(data['sam_z'].diff()) > 0].index+1]
-            sam_z_move = np.abs(self.data['sam_z'].diff()) > 0.0 # First move of sam_z to return to blocking the beam
+            sam_z_move = self.data['sam_z'].diff().abs() > 0.0 # First move of sam_z to return to blocking the beam
+            sam_z_move.loc[0] = False # change NaN to False
             sam_z_move_index = self.data['sam_z'][sam_z_move].index+1
-            begin_refl_angle = self.data['sam_th'][sam_z_move_index] # First angle to collect data
-            begin_ccd_angle = self.data['det_th'][sam_z_move_index] # First detector angle to collect data
+            begin_refl_angle = self.data['sam_th'][sam_z_move_index].iloc[0] # First angle to collect data
+            begin_ccd_angle = self.data['det_th'][sam_z_move_index].iloc[0] # First detector angle to collect data
             sam_th_offset = np.round((begin_ccd_angle/2 - begin_refl_angle).iloc[0],4) # Should be in th-2th configuration
             self.data['sam_th'] += sam_th_offset # Correct for offset
             self.process_vars['sam_th_offset'] # Save offset
