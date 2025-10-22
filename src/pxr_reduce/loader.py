@@ -929,3 +929,22 @@ def dict_load_fits(file):
         data['image'] = hdul[2].data
         
     return data
+    
+def stitchratio(x, R):
+    
+    """
+    Curve Fit function to calculate scalar stitch ratio
+
+    Parameters
+    -----------
+    x : float
+        dependent variable [arb]
+    R : float
+        Scale factor [arb]
+        
+    Returns
+    --------
+    out : y
+        independent variable [arb]
+    """
+    return R*x
