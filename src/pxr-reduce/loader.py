@@ -14,7 +14,11 @@ from astropy.io import fits # To load .fits files
 
 # Plotting libraries
 import matplotlib.pyplot as plt
-import matpotlib.colors as mpl_colors
+import matplotlib.colors as mpl_colors
+
+# Other libraries
+from tqdm.auto import tqdm
+tqdm.pandas()
 
 from utils import attributes, image, units
 
@@ -179,7 +183,7 @@ class PrsoxrLoader:
 
     process_vars = {
         'exposure_offset': 0.00389278, # [s]
-        'energy_resolution': 20 # 0.05eV step resolution
+        'energy_resolution': 20, # 0.05eV step resolution
         'sam_th_offset': None, # [deg]
         'sam_th_correction': True,
         'energy_offset': 0, # [eV]
@@ -252,12 +256,12 @@ class PrsoxrLoader:
         # Get information about the sample / path from the first fits file
         path0 = self.files[0]
         self.path = path0.parent
-        self.name = re.search(r'^(.*)[ _](\d+)\.fits$', path0.name).group(1)
+        self.name = re.search(r'^(.*?)[ _-](\d+)\.fits$', path0.name).group(1)
         
         for i, fits in tqdm(enumerate(self.files), "Loading .fits", total=len(self.files)):
             # Collect information about the filepath to save -- 
             fits_name = fits.name # The name of the current file
-            fits_index = int(re.search(r'[ _](\d+)\.fits$', fits_name).group(1)) # Index of the file (if it gets messed up for some reason)
+            fits_index = int(re.search(r'[ _-](\d+)\.fits$', fits_name).group(1)) # Index of the file (if it gets messed up for some reason)
             # Load the data
             df_fits = dict_load_fits(fits) # Load .fits files into a dictionary
             if AI_file is not None: #Only run if the meta-data needs to be reuplodaed from the .txt file
