@@ -906,3 +906,25 @@ class PrsoxrLoader:
             # Save this mark so we don't double-up in edge cases
             prev_mark_index = i
         return df
+        
+        
+        
+def dict_load_fits(file):
+    """
+    loads a .fits file and returns the image file and meta data
+    Returns
+    -------
+    image : numpy.ndarray
+        A numpy array from the .fits file
+    meta : dictionary
+        meta data from fits loaded as a dictionary.
+    """
+    data = {}
+    with fits.open(file) as hdul:
+        header = hdul[0].header
+        del header['COMMENT']  # Drop some broken non-values
+        for item in header:
+            data[item] = header[item]
+        data['image'] = hdul[2].data
+        
+    return data
