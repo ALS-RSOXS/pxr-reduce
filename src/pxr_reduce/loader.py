@@ -197,7 +197,7 @@ class PrsoxrLoader:
         'drop_failed_stitch': True,
         'stitch_mark_tol': 1e-5, #[unitless]
         'dark_pix_offset': 20, # [pixels]
-        'new_scan_marker': 5, # [mm] # Way to indicate a new sample by z-motion
+        'new_scan_marker': 10, # [mm] # Way to indicate a new sample by z-motion
         'drift_distance': 25, # [pixels] # Distance that the beam can drift from the nominal positions
         'mask_threshold': 800, # [counts] # Counts that indicate an easy spot for masking
         'filter_size': 3,
