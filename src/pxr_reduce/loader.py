@@ -8,6 +8,7 @@ import pathlib
 import numpy as np
 import pandas as pd
 from scipy.odr import ODR, Model, RealData # For finding stitch ratio
+from scipy.ndimage import median_filter
 
 # Image libraries
 from astropy.io import fits # To load .fits files
@@ -252,7 +253,6 @@ class PrsoxrLoader:
 
         # Load the files into the Loader
         tmp = []
-
         # Get information about the sample / path from the first fits file
         path0 = self.files[0]
         self.path = path0.parent
@@ -261,7 +261,8 @@ class PrsoxrLoader:
         for i, fits in tqdm(enumerate(self.files), "Loading .fits", total=len(self.files)):
             # Collect information about the filepath to save -- 
             fits_name = fits.name # The name of the current file
-            fits_index = int(re.search(r'[ _-](\d+)\.fits$', fits_name).group(1)) # Index of the file (if it gets messed up for some reason)
+            #fits_index = int(re.search(r'[ _-](\d+)\.fits$', fits_name).group(1)) # Index of the file (if it gets messed up for some reason)
+            fits_index = extract_index(fits_name)
             # Load the data
             df_fits = dict_load_fits(fits) # Load .fits files into a dictionary
             if AI_file is not None: #Only run if the meta-data needs to be reuplodaed from the .txt file
@@ -271,7 +272,6 @@ class PrsoxrLoader:
             tmp.append(df_fits) # save the file
         data_dict = {key: [d[key] for d in tmp] for key in tmp[0].keys()}
         df = pd.DataFrame(data_dict)
-        
         # Rename the files and only extract those that matter--
         self.data = df[list(header_names.keys())].rename(columns=header_names).round(header_resolutions)
         self.data['energy'] = np.round(self.data['energy']*self.process_vars['energy_resolution'])/self.process_vars['energy_resolution'] # round energy to the nearest 0.25 eV
@@ -364,7 +364,7 @@ class PrsoxrLoader:
             sam_z_move_index = self.data['sam_z'][sam_z_move].index+1
             begin_refl_angle = self.data['sam_th'][sam_z_move_index].iloc[0] # First angle to collect data
             begin_ccd_angle = self.data['det_th'][sam_z_move_index].iloc[0] # First detector angle to collect data
-            sam_th_offset = np.round((begin_ccd_angle/2 - begin_refl_angle).iloc[0],4) # Should be in th-2th configuration
+            sam_th_offset = np.round((begin_ccd_angle/2 - begin_refl_angle),4) # Should be in th-2th configuration
             self.data['sam_th'] += sam_th_offset # Correct for offset
             self.process_vars['sam_th_offset'] # Save offset
             print(f"----")
@@ -374,8 +374,8 @@ class PrsoxrLoader:
             print(f"Reprocess data with 'loader.process_vars['sam_th_correction']=False' to prevent automatic offset")
             print(f"----")
         # Now that energy and theta are calculated correctly, make the q-col
-        self.data['wavelength'] = self.data['energy'].apply(lambda x: energy_to_wavelength(x))
-        self.data['q'] = self.data.apply(lambda df: theta_to_q(np.deg2rad(df['sam_th']), df['wavelength']), axis=1)
+        self.data['wavelength'] = self.data['energy'].apply(lambda x: units.energy_to_wavelength(x))
+        self.data['q'] = self.data.apply(lambda df: units.theta_to_q(np.deg2rad(df['sam_th']), df['wavelength']), axis=1)
 
     def clean_images(self):
         
@@ -387,7 +387,7 @@ class PrsoxrLoader:
         )
         # Dezinger the images
         self.data['zinged_image'] = self.data.apply(
-            lambda df: dezinger_image(df['raw_image'], med_result=df['filtered_image']),
+            lambda df: image.dezinger_image(df['raw_image'], med_result=df['filtered_image']),
             axis=1,
         )
 
@@ -948,3 +948,20 @@ def stitchratio(x, R):
         independent variable [arb]
     """
     return R*x
+
+
+def extract_index(filename):
+    # Remove extension if present
+    base = filename.split('.')[0]
+    parts = base.split('_')
+
+    # Try to find the index: assume it's the numeric part not tied to sample count
+    numeric_parts = [p for p in parts if p.isdigit()]
+    
+    if len(numeric_parts) == 2:
+        # Assume sample number is always higher → index is the smaller one
+        return min(map(int, numeric_parts))
+    elif len(numeric_parts) == 1:
+        return int(numeric_parts[0])
+    else:
+        raise ValueError(f"Could not determine index from: {filename}")

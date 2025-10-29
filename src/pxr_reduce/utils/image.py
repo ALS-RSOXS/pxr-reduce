@@ -28,7 +28,7 @@ def dezinger_image(image, med_result=None, threshold=10, size=3):
         New image after being zinged
     """
     if med_result is None:
-        med_result = ndimage.median_filter(image, size=size)  # Apply Median Filter to image if needed
+        med_result = median_filter(image, size=size)  # Apply Median Filter to image if needed
     # Calculate Ratio of each pixel to compared to a threshold
     diff_image = image / np.abs(med_result)  
     # Repopulate image by removing pixels that exceed the threshold 
