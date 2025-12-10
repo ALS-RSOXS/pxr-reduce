@@ -1,7 +1,8 @@
 """
-Companion decorator for the PrsoxrLoader class. 
+Companion decorator for the PrsoxrLoader class.
 
 """
+
 
 def process_vars_properties(cls):
     """
@@ -9,7 +10,7 @@ def process_vars_properties(cls):
     in a class-level dictionary called 'process_vars'.
     """
     # Get the dictionary from the class object itself.
-    if hasattr(cls, 'process_vars') and isinstance(cls.process_vars, dict):
+    if hasattr(cls, "process_vars") and isinstance(cls.process_vars, dict):
         process_vars_keys = cls.process_vars.keys()
 
         for key in process_vars_keys:
@@ -21,10 +22,10 @@ def process_vars_properties(cls):
 
             def setter(instance, value, k=key):
                 """Sets the value in instance.process_vars[k]."""
-                #print(f"--- Setting '{k}' to '{value}'. Updating process_vars dictionary. ---")
+                # print(f"--- Setting '{k}' to '{value}'. Updating process_vars dictionary. ---")
                 instance.process_vars[k] = value
-                if 'reprocess_vars' not in k:
-                    instance.process_vars['reprocess_vars'] = True
+                if "reprocess_vars" not in k:
+                    instance.process_vars["reprocess_vars"] = True
 
             # Use setattr() to attach the new property directly to the class.
             setattr(cls, key, property(getter, setter))
