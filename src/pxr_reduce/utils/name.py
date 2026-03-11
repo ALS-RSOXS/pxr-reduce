@@ -67,8 +67,9 @@ def infer_index_regex(
     # Pick the candidate with the largest numeric span (most significant)
     best_pos = max(
         candidate_positions,
-        key=lambda p: int(numeric_matches[-1][p].group())
-        - int(numeric_matches[0][p].group()),
+        key=lambda p: (
+            int(numeric_matches[-1][p].group()) - int(numeric_matches[0][p].group())
+        ),
     )
 
     # ------------------------------------------------------------------
