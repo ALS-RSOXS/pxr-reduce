@@ -22,7 +22,7 @@ from tqdm.auto import tqdm
 
 tqdm.pandas()
 
-from utils import attributes, image, units, name
+from pxr_reduce.utils import attributes, image, units, name
 
 default_cmap = "terrain"
 
@@ -539,18 +539,22 @@ class PrsoxrLoader:
         self.data["counts_dark"] = self.data.apply(lambda df: df["dark"].sum(), axis=1)
         # Subtract and calculate the intensity
         self.data["counts_refl"] = self.data.apply(
-            lambda df: (df["counts_spot"] - df["counts_dark"])
-            / (df["exposure"] * df["beam_current"]),
+            lambda df: (
+                (df["counts_spot"] - df["counts_dark"])
+                / (df["exposure"] * df["beam_current"])
+            ),
             axis=1,
         )
         self.data["counts_err"] = self.data.apply(
-            lambda df: (df["counts_spot"] - df["counts_dark"])
-            / (df["exposure"] * df["beam_current"]),
+            lambda df: (
+                (df["counts_spot"] - df["counts_dark"])
+                / (df["exposure"] * df["beam_current"])
+            ),
             axis=1,
         )
         # Calculate ratios to determine stitch viability
         self.data["counts_ratio"] = self.data.apply(
-            lambda df: (df["counts_spot"] / df["counts_dark"]), axis=1
+            lambda df: df["counts_spot"] / df["counts_dark"], axis=1
         )
 
         self.data["is_saturated"] = self.data.apply(
@@ -723,7 +727,6 @@ class PrsoxrLoader:
         )
 
         if d:
-
             fig, ax = plt.subplots(
                 3, 2, subplot_kw={"xticks": [], "yticks": []}
             )  # , figsize=(12, 8))
@@ -1031,7 +1034,7 @@ class PrsoxrLoader:
             # If no values were determined "SAFE" for stitching,
             if len(safe_stitch_values) == 0 & self.process_vars["drop_failed_stitch"]:
                 print(f"----")
-                print(f"Failed stitch occured at index {igroup+i}")
+                print(f"Failed stitch occured at index {igroup + i}")
                 print(f"Energy: {df['energy'].iloc[i]} eV")
                 print(f"Theta: {df['sam_th'].iloc[i]}")
                 print(f"Masking all non-stitched points")
@@ -1059,9 +1062,11 @@ class PrsoxrLoader:
                 df["scale"].iloc[i:].apply(lambda x: x * scalei)
             )
             df.loc[igroup + i :, "scale_err"] = df.iloc[i:].apply(
-                lambda x: x["scale"]
-                * ((x["scale_err"] / x["scale"]) ** 2 + (scale_erri / scalei) ** 2)
-                ** 0.5,
+                lambda x: (
+                    x["scale"]
+                    * ((x["scale_err"] / x["scale"]) ** 2 + (scale_erri / scalei) ** 2)
+                    ** 0.5
+                ),
                 axis=1,
             )
             # Save this mark so we don't double-up in edge cases
