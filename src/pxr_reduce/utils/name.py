@@ -42,6 +42,13 @@ def infer_index_regex(
         raise ValueError("At least two filenames are required to infer a sequence.")
 
     # ------------------------------------------------------------------
+    # 0. Sort filenames using a natural/numeric sort so that, e.g.,
+    #    "file_9.fits" comes before "file_10.fits" and "file_1000.fits"
+    #    regardless of how the OS or glob returned them.
+    # ------------------------------------------------------------------
+    filenames = sorted(filenames, key=_natural_sort_key)
+
+    # ------------------------------------------------------------------
     # 1. Locate every numeric substring in each filename
     # ------------------------------------------------------------------
     numeric_matches = [list(re.finditer(r"\d+", fn)) for fn in filenames]
@@ -98,3 +105,15 @@ def infer_index_regex(
 
     pattern = f"^{prefix_pat}{index_pat}{suffix_lit}$"
     return pattern
+    
+    
+def _natural_sort_key(s: str):
+    """
+    Generate a sort key that orders strings with embedded integers numerically.
+    e.g. ["file_9", "file_10", "file_100"] sorts correctly instead of
+    lexicographically as ["file_10", "file_100", "file_9"].
+    """
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", s)
+    ]

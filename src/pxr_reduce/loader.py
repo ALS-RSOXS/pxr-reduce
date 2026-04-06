@@ -238,6 +238,8 @@ class PrsoxrLoader:
             msg = "PrsoxrLoader was not given a correct input. Only paths to FITS files are currently accepted."
             raise ValueError(msg)
             return 0
+        # Convert path_list to paths if needed
+        path_list = file_sort.ensure_paths(path_list)
         # Verify that the files have an order associated with the name
         try:
             re_name = name.infer_index_regex(
