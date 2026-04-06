@@ -22,7 +22,7 @@ from tqdm.auto import tqdm
 
 tqdm.pandas()
 
-from pxr_reduce.utils import attributes, image, units, name
+from pxr_reduce.utils import attributes, image, units, name, file_sort
 
 default_cmap = "terrain"
 
