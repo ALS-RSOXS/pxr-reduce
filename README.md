@@ -10,7 +10,7 @@
 [License: MIT](https://github.com/als-rsoxs/pxr-reduce/blob/main/LICENSE)
 [Renovate](https://renovateapp.com/)
 
-Reducing pxr data from bl 11.0.1.2
+A collection of standalone tools for reducing pxr data from bl 11.0.1.2 at the ALS.
 
 ## Features
 
