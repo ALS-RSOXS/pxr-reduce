@@ -1,0 +1,55 @@
+.PHONY: verify fix lint format format-check type-check install test test-cov test-matrix test-matrix-cov pysentry docs docs-serve
+
+# Verify - check everything without making changes
+verify: lint format-check type-check
+
+# Fix - automatically fix what can be fixed
+fix:
+	uv run ruff check --fix .
+	uv run ruff format .
+
+# Individual targets
+lint:
+	uv run ruff check .
+
+format-check:
+	uv run ruff format --check .
+
+format:
+	uv run ruff format .
+
+type-check:
+	uv run ty check
+
+# Install all dependencies
+install:
+	uv sync --all-groups
+
+# Run tests
+test:
+	uv run pytest tests/ -v
+
+# Run tests with coverage
+test-cov:
+	uv run pytest --cov --cov-report=xml --cov-report=term-missing
+
+# Run tests across all Python versions
+test-matrix:
+	uv run hatch test
+
+# Run tests with coverage across all Python versions
+test-matrix-cov:
+	uv run hatch test --cover
+
+
+# Dependency vulnerability scanning
+pysentry:
+	uv run pysentry-rs
+
+
+# Documentation
+docs:
+	uv run mkdocs build
+
+docs-serve:
+	uv run mkdocs serve
