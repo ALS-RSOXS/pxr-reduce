@@ -1,0 +1,63 @@
+site_name: pxr-reduce
+site_description: Reducing pxr data from bl 11.0.1.2
+site_url: https://als-rsoxs.github.io/pxr-reduce
+repo_url: https://github.com/als-rsoxs/pxr-reduce
+repo_name: als-rsoxs/pxr-reduce
+edit_uri: edit/main/docs/
+
+extra:
+  als_group:
+    full_name: ALS RSOXS Group Project
+    acronym: REIXS
+    github_url: https://github.com/als-rsoxs
+    reixs_url: https://als.lbl.gov/science/photon-science-programs/rixs-program/
+
+theme:
+  name: rsoxs
+  show_title: true
+  show_stargazers: true
+  topbar_sections: false
+  features:
+    - content.code.copy
+    - content.code.annotate
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - toc.follow
+
+plugins:
+  - rsoxs
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths:
+            - src
+          options:
+            show_source: true
+            show_root_heading: true
+            show_root_toc_entry: true
+            docstring_style: google
+            merge_init_into_class: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+      css_class: codehilite
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - API Reference: api.md
+  - Contributing: contributing.md
