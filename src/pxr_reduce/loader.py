@@ -4,6 +4,8 @@
 import pathlib
 import re
 import warnings
+from collections.abc import Mapping
+from typing import Any, ClassVar, Final
 
 import matplotlib.colors as mpl_colors
 
@@ -62,6 +64,36 @@ header_resolutions = {
 
 stitch_motors = ["sam_th"]
 
+_DEFAULT_PROCESS_VARS: Final[dict[str, Any]] = {
+    "exposure_offset": 0.00389278,  # [s]
+    "energy_resolution": 20,  # 0.05eV step resolution
+    "sam_th_offset": None,  # [deg]
+    "sam_th_correction": True,
+    "energy_offset": 0,  # [eV]
+    "det_pixel_size": 0.027,  # [mm/pixel]
+    "roi_height": 10,  # [pixels]
+    "roi_width": 10,  # [pixels]
+    "trim_x": 10,  # [pixels]
+    "trim_y": 10,  # [pixels],
+    "stitch_cutoff": 1.003,  # [ratio]
+    "drop_failed_stitch": True,
+    "stitch_mark_tol": 1e-5,  # [unitless]
+    "dark_pix_offset": 20,  # [pixels]
+    "new_scan_marker": 15,  # [deg] # Way to indicate a new sample by th-motion
+    "drift_distance": 25,  # [pixels] # Distance that the beam can drift from
+    # the nominal positions
+    "mask_threshold": 800,  # [counts] # Counts that indicate an easy spot for mask
+    "filter_size": 3,
+    "darkside": "LHS",
+    "reprocess_vars": True,
+    "saturate_threshold": 2,
+}
+
+
+def _new_process_vars(**overrides: Any) -> dict[str, Any]:
+    """Fresh dict for ``instance.process_vars``."""
+    return {**_DEFAULT_PROCESS_VARS, **overrides}
+
 
 @attributes.process_vars_properties
 class PrsoxrLoader:
@@ -93,8 +125,8 @@ class PrsoxrLoader:
     Attributes
     -----------
     exposure_offset: float [s]
-        Offset to add to camera exposure time. Time it takes to physically open and close shutter.
-        This should be measured in advanced and not changed often.
+        Offset to add to camera exposure time. Time it takes to physically open and
+        close shutter. This should be measured in advanced and not changed often.
     energy_resoltion: float
         Energy will be normalized based on the following equation:
             np.round(self.data['energy']*energy_resolution)/energy_resolution
@@ -102,7 +134,8 @@ class PrsoxrLoader:
     sam_th_offset: float [th]
         Offset added to sam_th at the time of measurement default is None
     sam_th_correction: Bool
-        Default is True. It will determine the sam_th_offset based on the initial measurement positions
+        Default is True. It will determine the sam_th_offset based on the initial
+        measurement positions
     energy_offset: float [eV]
         Optional offset to the energy value. Defaults at 0
     det_pixel_size: float [mm/pixel]
@@ -114,7 +147,8 @@ class PrsoxrLoader:
     trim_x: int
         Number of pixels on the edge of the detector to remove fromm consideration
     trim_y: int
-        Number of pixels on the edge of the detector (vertical) to remove from considerations
+        Number of pixels on the edge of the detector (vertical) to remove from
+        considerations
     stitch_cutoff: float ['ratio']
         Used to identify positions at which a 'stitch' has occured between the data.
     drop_failed_stitch: bool
@@ -123,9 +157,11 @@ class PrsoxrLoader:
     stitch_mark_tol: float
         Value used to verify whether or not a tracked motor for stitching has moved
     dark_pix_offset: int [pixels]
-        Number of pixels to offset the region used for dark subtraction from the edge of the frame
+        Number of pixels to offset the region used for dark subtraction from the edge of
+         the frame
     new_scan_marker: float [deg]
-        How far the 'sam_th' motor needs to move in order to indicate a new 'scan' starting from 0
+        How far the 'sam_th' motor needs to move in order to indicate a new 'scan'
+        starting from 0
     drift_distance: int [pixels]
         Distance that the beam can drift from its nominal positions
     mask_threshold: int [counts]
@@ -142,7 +178,8 @@ class PrsoxrLoader:
     Notes
     ------
 
-    Print the loader to view variables that will be used in reduction. Update them using the attributes listed in this API.
+    Print the loader to view variables that will be used in reduction. Update them using
+    the attributes listed in this API.
 
     >>> loader = PrsoxrLoader(files, name='MF114A_spol')
     >>> print(loader) #Default values
@@ -169,7 +206,8 @@ class PrsoxrLoader:
 
 
     mask : np.ndarray (Boolean)
-        Array with dimensions equal to an image. Elements set to `False` will be excluded when finding beamcenter.
+        Array with dimensions equal to an image. Elements set to `False` will be
+        excluded when finding beamcenter.
 
         >>> # Recommended usage
         >>> loader = loader = PrsoxrLoader(files)
@@ -178,45 +216,27 @@ class PrsoxrLoader:
         >>> loader.mask = mask
     >>>
 
-    Once process attributes have been setup by the user, the function can be called to load the data. An ROI will need
-    to be specified at the time of processing. Use the ``self.check_spot()`` function to find appropriate dimensions.
+    Once process attributes have been setup by the user, the function can be called to
+    load the data. An ROI will need
+    to be specified at the time of processing. Use the ``self.check_spot()`` function
+    to find appropriate dimensions.
 
     >>> refl = loader(h=40, w=30)
 
-    Data that has been loaded can be exported using the ``self.save_csv(path)`` and ``self.save_hdf5(path)`` functions.
+    Data that has been loaded can be exported using the ``self.save_csv(path)`` and
+    ``self.save_hdf5(path)`` functions.
 
     """
 
-    process_vars = {
-        "exposure_offset": 0.00389278,  # [s]
-        "energy_resolution": 20,  # 0.05eV step resolution
-        "sam_th_offset": None,  # [deg]
-        "sam_th_correction": True,
-        "energy_offset": 0,  # [eV]
-        "det_pixel_size": 0.027,  # [mm/pixel]
-        "roi_height": 10,  # [pixels]
-        "roi_width": 10,  # [pixels]
-        "trim_x": 10,  # [pixels]
-        "trim_y": 10,  # [pixels],
-        "stitch_cutoff": 1.003,  # [ratio]
-        "drop_failed_stitch": True,
-        "stitch_mark_tol": 1e-5,  # [unitless]
-        "dark_pix_offset": 20,  # [pixels]
-        "new_scan_marker": 15,  # [deg] # Way to indicate a new sample by th-motion
-        "drift_distance": 25,  # [pixels] # Distance that the beam can drift from the nominal positions
-        "mask_threshold": 800,  # [counts] # Counts that indicate an easy spot for masking
-        "filter_size": 3,
-        "darkside": "LHS",
-        "reprocess_vars": True,
-        "saturate_threshold": 2,
-    }
+    process_vars_defaults: ClassVar[Mapping[str, Any]] = _DEFAULT_PROCESS_VARS
 
     def __init__(
         self, files, AI_file=None, auto_load=False, energy_resolution=20, **kwargs
     ):
         # Update the process variables with any initial conditions
-        self.process_vars = self.process_vars.copy()
-        self.process_vars.update(kwargs)
+        self.process_vars = _new_process_vars(**kwargs)
+        if energy_resolution not in self.process_vars:
+            self.process_vars["energy_resolution"] = energy_resolution
 
         # Check type of files of input---
         self.files = []
