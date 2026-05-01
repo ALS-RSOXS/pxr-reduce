@@ -1,29 +1,30 @@
 """Loader for PRSoXR data from beamline 11.0.1.2 taken with the CCD camera."""
+
 # Basic modules
-import warnings
-import copy
-import re
 import pathlib
+import re
+import warnings
+
+import matplotlib.colors as mpl_colors
+
+# Plotting libraries
+import matplotlib.pyplot as plt
 
 # Math libraries
 import numpy as np
 import pandas as pd
-from scipy.odr import ODR, Model, RealData  # For finding stitch ratio
-from scipy.ndimage import median_filter
 
 # Image libraries
 from astropy.io import fits  # To load .fits files
-
-# Plotting libraries
-import matplotlib.pyplot as plt
-import matplotlib.colors as mpl_colors
+from scipy.ndimage import median_filter
+from scipy.odr import ODR, Model, RealData  # For finding stitch ratio
 
 # Other libraries
 from tqdm.auto import tqdm
 
-tqdm.pandas()
+from pxr_reduce.utils import attributes, file_sort, image, name, units
 
-from pxr_reduce.utils import attributes, image, units, name, file_sort
+tqdm.pandas()
 
 default_cmap = "terrain"
 
@@ -221,16 +222,16 @@ class PrsoxrLoader:
         self.files = []
         # Is files empty?
         if len(files) == 0:
-            print(f"The 'files' input is empty. Nothing can be loaded.")
-            print(f"Check your directory for FITS files.")
+            print("The 'files' input is empty. Nothing can be loaded.")
+            print("Check your directory for FITS files.")
             return 0
         msg = f"Found samples: {len(files)}\n"
-        msg += f"Beginning data loading..."
+        msg += "Beginning data loading..."
         print(msg)
         # Is files a single list?
         if isinstance(files, (str, pathlib.Path)):
             print(
-                f"A single file is being loaded. This will not process correctly as a RSoXR experiment."
+                "A single file is being loaded. This will not process correctly as a RSoXR experiment."
             )
             path_list = [files]
         elif isinstance(files, list):
@@ -249,7 +250,7 @@ class PrsoxrLoader:
             msg = f"\n Naming convention successfully identified: {re_name}\n"
             print(msg)
         except ValueError as ve:
-            msg = f"Filenames do not appear to have a numeric index that can be inferred for ordering.\n"
+            msg = "Filenames do not appear to have a numeric index that can be inferred for ordering.\n"
             msg += f"Error details: {ve}"
             raise ValueError(msg)
 
@@ -265,7 +266,7 @@ class PrsoxrLoader:
 
         # Check AI File
         if isinstance(AI_file, (str, pathlib.Path)):
-            print(f"Loading AI-file to supplement FITS meta-data")
+            print("Loading AI-file to supplement FITS meta-data")
             AI_file = pathlib.Path(AI_file)
             if not AI_file.is_file():
                 msg = f"{AI_file} is not a valid file."
@@ -355,7 +356,7 @@ class PrsoxrLoader:
 
     def load_AI_meta(self, file=None):
         # Load .txt file here to supplement metadata if needed
-        with open(file, "r") as f:
+        with open(file) as f:
             for i, line in enumerate(f):
                 if "DATA" in line:
                     header_line = i
@@ -430,16 +431,16 @@ class PrsoxrLoader:
             )  # Should be in th-2th configuration
             self.data["sam_th"] += sam_th_offset  # Correct for offset
             self.process_vars["sam_th_offset"]  # Save offset
-            print(f"----")
-            print(f"sam_th offset not given.")
+            print("----")
+            print("sam_th offset not given.")
             print(
                 f"Assuming a th-2th geometry -> Offset determed to be sam_th_offset = {sam_th_offset} [deg]"
             )
-            print(f"Applying offset to data")
+            print("Applying offset to data")
             print(
-                f"Reprocess data with 'loader.process_vars['sam_th_correction']=False' to prevent automatic offset"
+                "Reprocess data with 'loader.process_vars['sam_th_correction']=False' to prevent automatic offset"
             )
-            print(f"----")
+            print("----")
         # Now that energy and theta are calculated correctly, make the q-col
         self.data["wavelength"] = self.data["energy"].apply(
             lambda x: units.energy_to_wavelength(x)
@@ -485,7 +486,7 @@ class PrsoxrLoader:
             self.data["zinged_image"]
         )
 
-        mask_loc = np.argwhere((mask_temp > threshold))
+        mask_loc = np.argwhere(mask_temp > threshold)
         grid_map = np.indices(mask_temp.shape)  # Get a grid
         mask = np.zeros_like(mask_temp, bool)  # Initially mask all points
         for xy in mask_loc:
@@ -690,11 +691,11 @@ class PrsoxrLoader:
 
     def check_spot(self, fits_index, d=1):
         if fits_index not in self.data["fits_index"]:
-            print(f"FITS file not found in loaded data, please verify index.")
+            print("FITS file not found in loaded data, please verify index.")
             return 0
         elif not self.data_processed:
             print(
-                f"Data has not yet been processed. Please run 'loader.reprocess_images()'."
+                "Data has not yet been processed. Please run 'loader.reprocess_images()'."
             )
             return 0
         elif self.process_vars["reprocess_vars"]:
@@ -777,7 +778,6 @@ class PrsoxrLoader:
             plt.show()
 
     def display_fits(self, fits_index, bs=True):
-
         df = self.data[self.data["fits_index"] == fits_index]
 
         fig, ax = plt.subplots(
@@ -833,7 +833,7 @@ class PrsoxrLoader:
         # Verify that the data has been processed and the metadata does not need to be recalculated
         if not self.data_processed:
             print(
-                f"Data has not yet been processed. Please run 'loader.reprocess_images()'."
+                "Data has not yet been processed. Please run 'loader.reprocess_images()'."
             )
             return 0
         elif self.process_vars["reprocess_vars"]:
@@ -844,7 +844,7 @@ class PrsoxrLoader:
 
         if self.data["is_saturated"].sum() > 0:
             warnings.warn(
-                f"The CCD was likely saturated during data collection. Stitching may be impacted"
+                "The CCD was likely saturated during data collection. Stitching may be impacted"
             )
 
         scans = (
@@ -1036,13 +1036,13 @@ class PrsoxrLoader:
             df.loc[igroup + i, "num_stitch_points"] = len(safe_stitch_values)
             # If no values were determined "SAFE" for stitching,
             if len(safe_stitch_values) == 0 & self.process_vars["drop_failed_stitch"]:
-                print(f"----")
+                print("----")
                 print(f"Failed stitch occured at index {igroup + i}")
                 print(f"Energy: {df['energy'].iloc[i]} eV")
                 print(f"Theta: {df['sam_th'].iloc[i]}")
-                print(f"Masking all non-stitched points")
-                print(f"Check processing variables and re-calculate to try again")
-                print(f"----")
+                print("Masking all non-stitched points")
+                print("Check processing variables and re-calculate to try again")
+                print("----")
                 df.loc[igroup + i :, "failed_stitch_mask"] = 1
                 break
             # We successfully found a stitch point and are moving on.
