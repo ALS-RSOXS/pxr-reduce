@@ -4,7 +4,8 @@
 import pathlib
 import re
 import warnings
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any, ClassVar, Final
 
 import matplotlib.colors as mpl_colors
@@ -24,7 +25,7 @@ from scipy.odr import ODR, Model, RealData  # For finding stitch ratio
 # Other libraries
 from tqdm.auto import tqdm
 
-from pxr_reduce.utils import attributes, file_sort, image, name, units
+from pxr_reduce.utils import attributes, image, name, units
 
 tqdm.pandas()
 
@@ -231,38 +232,35 @@ class PrsoxrLoader:
     process_vars_defaults: ClassVar[Mapping[str, Any]] = _DEFAULT_PROCESS_VARS
 
     def __init__(
-        self, files, AI_file=None, auto_load=False, energy_resolution=20, **kwargs
+        self,
+        files: Iterable[str | Path] | Path | str,
+        AI_file: str | Path | None = None,
+        *,
+        auto_load: bool = False,
+        energy_resolution=20,
+        **kwargs,
     ):
         # Update the process variables with any initial conditions
         self.process_vars = _new_process_vars(**kwargs)
         if energy_resolution not in self.process_vars:
             self.process_vars["energy_resolution"] = energy_resolution
 
-        # Check type of files of input---
-        self.files = []
-        # Is files empty?
-        if len(files) == 0:
-            print("The 'files' input is empty. Nothing can be loaded.")
-            print("Check your directory for FITS files.")
-            return 0
-        msg = f"Found samples: {len(files)}\n"
-        msg += "Beginning data loading..."
-        print(msg)
-        # Is files a single list?
-        if isinstance(files, (str, pathlib.Path)):
-            print(
-                "A single file is being loaded. This will not process correctly as a RSoXR experiment."
-            )
-            path_list = [files]
-        elif isinstance(files, list):
-            path_list = files
-        else:
-            msg = "PrsoxrLoader was not given a correct input. Only paths to FITS files are currently accepted."
-            raise ValueError(msg)
-            return 0
-        # Convert path_list to paths if needed
-        path_list = file_sort.ensure_paths(path_list)
-        # Verify that the files have an order associated with the name
+        # Assert breaking behaviour on incorrect IO inputs
+        self.files: list[Path] = []
+        match files:
+            case Path():
+                # Check if it is a directory if so glob for .fits files
+                if files.is_dir():
+                    path_list = list(files.rglob("**/**.fits"))
+                else:
+                    from warnings import warn
+
+                    warn("A single file will not process correctly", stacklevel=2)
+                    path_list = [files]
+            case list():
+                path_list = [Path(file) for file in files]
+            case _:
+                raise TypeError(f"Invalid files input: {files}")
         try:
             re_name = name.infer_index_regex(
                 [path.name for path in path_list], prefix_group="re_sample_name"
@@ -270,18 +268,16 @@ class PrsoxrLoader:
             msg = f"\n Naming convention successfully identified: {re_name}\n"
             print(msg)
         except ValueError as ve:
-            msg = "Filenames do not appear to have a numeric index that can be inferred for ordering.\n"
+            msg = "Files do not conform to any known naming convention.\n"
             msg += f"Error details: {ve}"
-            raise ValueError(msg)
+            raise ValueError(msg) from ve
 
         for fp in path_list:
-            file = pathlib.Path(fp)
+            file: Path = Path(fp)
             if not file.is_file():
-                msg = f"{file} is not a valid file."
-                raise FileNotFoundError(msg)
+                raise FileNotFoundError(f"{file} is not a valid file.")
             if file.suffix != ".fits":
-                msg = f"{file} is not a FITS file."
-                raise ValueError(msg)
+                raise ValueError(f"{file} is not a FITS file.")
             self.files.append(file)
 
         # Check AI File
@@ -292,17 +288,20 @@ class PrsoxrLoader:
                 msg = f"{AI_file} is not a valid file."
                 raise FileNotFoundError(msg)
             if AI_file.suffix != ".txt":
-                msg = f"{AI_file} is not a txt file, it is unlikely the correct AI companion file."
+                msg = f"{AI_file} is not valid for provided data"
                 raise ValueError(msg)
         else:
-            AI_file = None
+            # Look for a companion AI file in the parent directory of the first file
+            AI_file = (
+                self.files[0].parent / f"{self.files[0].stem.split('-')[0]}-AI.txt"
+            )
+            AI_file = AI_file.resolve() if AI_file.exists() else None
 
         # Load the files into the Loader
         tmp = []
         # Get information about the sample / path from the first fits file
         path0 = self.files[0]
         self.path = path0.parent
-        # self.name = re.search(r'^(.*?)[ _-](\d+)\.fits$', path0.name).group('re_sample_name')
         self.name = re.search(re_name, path0.name).group("re_sample_name")
         print("")
         print(f"Sample name identified as: {self.name}")
