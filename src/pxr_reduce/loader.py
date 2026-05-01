@@ -1,3 +1,4 @@
+"""Loader for PRSoXR data from beamline 11.0.1.2 taken with the CCD camera."""
 # Basic modules
 import warnings
 import copy

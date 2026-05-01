@@ -1,8 +1,9 @@
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable, List, Union
+from typing import Any
 
 
-def ensure_paths(items: Union[Iterable[Union[str, Path]], str, Path]) -> List[Path]:
+def ensure_paths(items: Iterable[str | Path | Any] | str | Path) -> list[Path]:
     """
     Ensure `items` is a list of `pathlib.Path` objects.
     - Accepts a single `str` or `Path`, or an iterable of `str`/`Path`.
@@ -15,17 +16,21 @@ def ensure_paths(items: Union[Iterable[Union[str, Path]], str, Path]) -> List[Pa
 
     try:
         iterator = iter(items)
-    except TypeError:
-        raise TypeError("Input must be a Path/str or an iterable of Path/str")
+    except TypeError as e:
+        raise TypeError("Input must be a Path/str or an iterable of Path/str") from e
 
     out = []
     for i, it in enumerate(iterator):
-        if isinstance(it, Path):
-            out.append(it)
-        elif isinstance(it, str):
-            out.append(Path(it))
-        else:
-            raise TypeError(
-                f"Item at index {i} has unsupported type {type(it)}; expected str or pathlib.Path"
-            )
+        match it:
+            case Path():
+                out.append(it)
+            case str():
+                out.append(Path(it))
+            case _:
+                raise TypeError(
+                    f"""
+                    Item at index {i} has unsupported type {type(it)};
+                    expected str or pathlib.Path got {type(it)}
+                    """
+                ) from None
     return out
