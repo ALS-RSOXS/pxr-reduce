@@ -131,6 +131,9 @@ dmypy.json
 # IDE
 .idea/
 .vscode/
+
+# Cursor (local hook state)
+.cursor/hooks/state/
 *.swp
 *.swo
 *~
