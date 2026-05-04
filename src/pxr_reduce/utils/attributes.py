@@ -22,7 +22,6 @@ def process_vars_properties(cls):
 
             def setter(instance, value, k=key):
                 """Sets the value in instance.process_vars[k]."""
-                # print(f"--- Setting '{k}' to '{value}'. Updating process_vars dictionary. ---")
                 instance.process_vars[k] = value
                 if "reprocess_vars" not in k:
                     instance.process_vars["reprocess_vars"] = True

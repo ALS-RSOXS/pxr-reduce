@@ -2,12 +2,14 @@ import numpy as np
 from scipy.ndimage import median_filter
 
 
-# Replace pixels above a threshold with the average defined by a box of SIZE x SIZE around the pixel
+# Replace pixels above a threshold with the average defined by a box of SIZE x SIZE
+# around the pixel
 # -- From Jan Ilavsky's IGOR implementation.
 def dezinger_image(image, med_result=None, threshold=10, size=3):
     """
     Function to remove potential hot pixels during data collection.
-    Replaces pixels that have intensity greater than threshold above its nearest neighbors
+    Replaces pixels that have intensity greater than threshold above its nearest
+    neighbors.
 
     Parameters
     -----------

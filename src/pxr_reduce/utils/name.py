@@ -1,21 +1,20 @@
 import re
-from typing import List, Optional
 
 
 def infer_index_regex(
-    filenames: List[str],
+    filenames: list[str],
     *,
     index_group: str = "index",
-    prefix_group: Optional[str] = None,
+    prefix_group: str | None = None,
 ) -> str:
     """
-    Infer a regular‑expression that captures the integer which increments by 1
+    Infer a regular-expression that captures the integer which increments by 1
     across a list of FITS filenames.
 
     Parameters
     ----------
     filenames : list[str]
-        List of filenames (at least two entries). All must end with a similar extension –
+        List of filenames (at least two entries). All must end with a similar extension
         the suffix is not enforced, the algorithm works on any common pattern.
 
     index_group : str, optional
@@ -105,8 +104,8 @@ def infer_index_regex(
 
     pattern = f"^{prefix_pat}{index_pat}{suffix_lit}$"
     return pattern
-    
-    
+
+
 def _natural_sort_key(s: str):
     """
     Generate a sort key that orders strings with embedded integers numerically.
@@ -114,6 +113,5 @@ def _natural_sort_key(s: str):
     lexicographically as ["file_10", "file_100", "file_9"].
     """
     return [
-        int(part) if part.isdigit() else part.lower()
-        for part in re.split(r"(\d+)", s)
+        int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", s)
     ]
