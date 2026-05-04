@@ -16,7 +16,6 @@ A collection of standalone tools for reducing pxr data from bl 11.0.1.2 at the A
 
 - Fast and modern Python toolchain using Astral's tools (uv, ruff, ty)
 - Type-safe with full type annotations
-- Command-line interface built with Typer
 - Comprehensive documentation with MkDocs — [View Docs](https://als-rsoxs.github.io/pxr-reduce/)
 
 ## Installation
@@ -34,19 +33,11 @@ uv add pxr_reduce
 ## Quick Start
 
 ```python
-import pxr_reduce
+from importlib.metadata import version
 
-print(pxr_reduce.__version__)
-```
+from pxr_reduce import PrsoxrLoader
 
-### CLI Usage
-
-```bash
-# Show version
-pxr_reduce --version
-
-# Say hello
-pxr_reduce hello World
+print(version("pxr_reduce"))
 ```
 
 ## Development

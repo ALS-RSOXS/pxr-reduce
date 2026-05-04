@@ -59,9 +59,6 @@ Repository = "https://github.com/als-rsoxs/pxr-reduce"
 Issues = "https://github.com/als-rsoxs/pxr-reduce/issues"
 Changelog = "https://github.com/als-rsoxs/pxr-reduce/blob/main/CHANGELOG.md"
 
-[project.scripts]
-pxr_reduce = "pxr_reduce.cli:app"
-
 # =============================================================================
 # Hatch
 # =============================================================================

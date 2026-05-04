@@ -19,21 +19,11 @@ uv add pxr_reduce
 ## Quick Start
 
 ```python
-import pxr_reduce
+from importlib.metadata import version
 
-print(pxr_reduce.__version__)
-```
+from pxr_reduce import PrsoxrLoader
 
-### Command Line Interface
-
-pxr-reduce provides a command-line interface:
-
-```bash
-# Show version
-pxr_reduce --version
-
-# Say hello
-pxr_reduce hello World
+print(version("pxr_reduce"))
 ```
 
 ## Development
