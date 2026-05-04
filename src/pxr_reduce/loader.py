@@ -302,21 +302,22 @@ class PrsoxrLoader:
         # Get information about the sample / path from the first fits file
         path0 = self.files[0]
         self.path = path0.parent
-        self.name = re.search(re_name, path0.name).group("re_sample_name")
+        m = re.search(re_name, path0.name)
+        self.name = m.group("re_sample_name") if m else "Unknown Sample"
         print("")
         print(f"Sample name identified as: {self.name}")
         print("")
 
-        for i, fits in tqdm(
-            enumerate(self.files), "Loading .fits", total=len(self.files)
-        ):
+        for file in tqdm(self.files, "Loading .fits", total=len(self.files)):
             # Collect information about the filepath to save --
-            fits_name = fits.name  # The name of the current file
-            # fits_index = int(re.search(r'[ _-](\d+)\.fits$', fits_name).group(1)) # Index of the file (if it gets messed up for some reason)
+            fits_name = file.name  # The name of the current file
+            # fits_index = int(re.search(r'[ _-](\d+)\.fits$', fits_name).group(1))
+            # Index of the file (if it gets messed up for some reason)
             # fits_index = extract_index(fits_name)
-            fits_index = int(re.search(re_name, fits_name).group("index"))
+            m = re.search(re_name, fits_name)
+            fits_index = int(m.group("index")) if m else -1
             # Load the data
-            df_fits = dict_load_fits(fits)  # Load .fits files into a dictionary
+            df_fits = dict_load_fits(file)  # Load .fits files into a dictionary
             if (
                 AI_file is not None
             ):  # Only run if the meta-data needs to be reuplodaed from the .txt file
@@ -326,10 +327,10 @@ class PrsoxrLoader:
                 )  # get the correct line item in the AI file --
             df_fits["fits_index"] = fits_index  # Save the index
             tmp.append(df_fits)  # save the file
-        data_dict = {key: [d[key] for d in tmp] for key in tmp[0].keys()}
+        data_dict = {key: [d[key] for d in tmp] for key in tmp[0]}
         df = pd.DataFrame(data_dict)
         # Rename the files and only extract those that matter--
-        self.data = (
+        self.data: pd.DataFrame = (
             df[list(header_names.keys())]
             .rename(columns=header_names)
             .round(header_resolutions)
@@ -373,9 +374,10 @@ class PrsoxrLoader:
     def __call__(self):
         return self.calc_refl()
 
-    def load_AI_meta(self, file=None):
+    def load_AI_meta(self, file: str | Path):
         # Load .txt file here to supplement metadata if needed
-        with open(file) as f:
+        with Path(file).open("r") as f:
+            header_line = 0
             for i, line in enumerate(f):
                 if "DATA" in line:
                     header_line = i
@@ -403,8 +405,8 @@ class PrsoxrLoader:
 
     def reprocess_images(self):
         self.cleanup_metadata()
-        self.clean_images()  # Filter and zing the images for further reduction. Only do this once.
-        self.generate_series_mask()  # Create a mask based on the total drift of teh beam and a radial threshold.
+        self.clean_images()  # Filter and zing the images for further reduction.
+        self.generate_series_mask()  # Create a total drift radial mask
         # self.locate_beam_byscan()
         self.process_images()
         self.reprocess_vars = False
@@ -419,7 +421,8 @@ class PrsoxrLoader:
             lambda x: x + self.process_vars["exposure_offset"] if x > 0 else 1
         )
 
-        # Label each sample in terms of the 'scan'. different scans can have the same energy/pol/steps
+        # Label each sample in terms of the 'scan'. different scans can have the same
+        # energy/pol/steps
         new_scan_markers = (
             np.abs(self.data["sam_th"].diff()) > self.process_vars["new_scan_marker"]
         )
@@ -430,7 +433,7 @@ class PrsoxrLoader:
         self.data["energy"] += self.process_vars["energy_offset"]
         # Theta
         if (
-            self.process_vars["sam_th_offset"] == None
+            self.process_vars["sam_th_offset"] is None
             and self.process_vars["sam_th_correction"]
         ):  # Was a sample theta offset given to the loader?
             # [data['sam_z'][np.abs(data['sam_z'].diff()) > 0].index+1]
@@ -453,11 +456,17 @@ class PrsoxrLoader:
             print("----")
             print("sam_th offset not given.")
             print(
-                f"Assuming a th-2th geometry -> Offset determed to be sam_th_offset = {sam_th_offset} [deg]"
+                f"""
+                Assuming a th-2th geometry -> Offset determed:\n
+                am_th_offset = {sam_th_offset} [deg]
+                """
             )
             print("Applying offset to data")
             print(
-                "Reprocess data with 'loader.process_vars['sam_th_correction']=False' to prevent automatic offset"
+                """
+                Reprocess data with 'loader.process_vars['sam_th_correction']=False'
+                to prevent automatic offset
+                """
             )
             print("----")
         # Now that energy and theta are calculated correctly, make the q-col
@@ -500,7 +509,8 @@ class PrsoxrLoader:
         r = self.process_vars[
             "drift_distance"
         ]  # The distance that you will allow for the beam to move between each photo
-        # Identify all the locations where the beam will likely be located. Hot spots are eay to grab
+        # Identify all the locations where the beam will likely be located. Hot spots
+        # are eay to grab
         mask_temp = self.data["zinged_image"].copy().sum() / len(
             self.data["zinged_image"]
         )
@@ -549,7 +559,8 @@ class PrsoxrLoader:
         self.data["roi_d"] = self.data.apply(
             lambda df: self.update_dark_roi(df["beam_spot"]), axis=1
         )
-        # Find the locations of the collected image to integrate for beam and the dark frame
+        # Find the locations of the collected image to integrate for beam and the dark
+        # frame
         self.data["spot"] = self.data.apply(
             lambda df: df["reduced_image"][df["roi"]], axis=1
         )
@@ -621,7 +632,7 @@ class PrsoxrLoader:
 
         return (sly, slx)
 
-    def subtract_background(self, image, dark):
+    def subtract_background(self, image):
         bkg_sub = self.process_vars["bkg_sub"]
         left = image[:, :bkg_sub]
         right = image[:, -bkg_sub:]
@@ -633,10 +644,7 @@ class PrsoxrLoader:
 
     def check_saturation(self, image, threshold=1):
         maxcounts = image.max()
-        if (2**16 - maxcounts) < threshold:
-            return True
-        else:
-            return False
+        return 2**16 - maxcounts < threshold
 
     def locate_beam_byscan(self, save_mask=True):
         current_scan = 0
@@ -708,14 +716,12 @@ class PrsoxrLoader:
         yloc += h // 2
         return (yloc, xloc), distance_mask
 
-    def check_spot(self, fits_index, d=1):
+    def check_spot(self, fits_index, d=1, *, extended_output=False):
         if fits_index not in self.data["fits_index"]:
             print("FITS file not found in loaded data, please verify index.")
             return 0
         elif not self.data_processed:
-            print(
-                "Data has not yet been processed. Please run 'loader.reprocess_images()'."
-            )
+            print("Data not processed. Please run 'loader.reprocess_images()'")
             return 0
         elif self.process_vars["reprocess_vars"]:
             self.cleanup_metadata()
@@ -766,7 +772,7 @@ class PrsoxrLoader:
 
             # Mask if necessary
             if self.mask is not None:
-                mask_display = np.ma.masked_where(self.mask == True, self.mask)
+                mask_display = np.ma.masked_where(self.mask, self.mask)
                 ax[0, 0].imshow(mask_display, cmap="Greys_r")
                 ax[0, 1].imshow(mask_display, cmap="Greys_r")
 
@@ -795,8 +801,10 @@ class PrsoxrLoader:
 
             plt.tight_layout()
             plt.show()
+            if extended_output:
+                return fig, ax
 
-    def display_fits(self, fits_index, bs=True):
+    def display_fits(self, fits_index, bs=True, extended_output=False):
         df = self.data[self.data["fits_index"] == fits_index]
 
         fig, ax = plt.subplots(
@@ -813,7 +821,7 @@ class PrsoxrLoader:
 
         # Mask if necessary
         if self.mask is not None:
-            mask_display = np.ma.masked_where(self.mask == True, self.mask)
+            mask_display = np.ma.masked_where(self.mask, self.mask)
             ax[0, 0].imshow(mask_display, cmap="Greys_r")
             ax[0, 1].imshow(mask_display, cmap="Greys_r")
 
@@ -843,17 +851,18 @@ class PrsoxrLoader:
 
         plt.tight_layout()
         plt.show()
+        if extended_output:
+            return fig, ax
 
     def calc_refl(self, drop_duplicates=True):
         """
         Function that performs a data reduction of PRSOXR data.
         """
 
-        # Verify that the data has been processed and the metadata does not need to be recalculated
+        # Verify that the data has been processed and the metadata does not need to be
+        #  recalculated
         if not self.data_processed:
-            print(
-                "Data has not yet been processed. Please run 'loader.reprocess_images()'."
-            )
+            print("Data has not processed. Please run 'loader.reprocess_images()'.")
             return 0
         elif self.process_vars["reprocess_vars"]:
             self.cleanup_metadata()
@@ -863,10 +872,11 @@ class PrsoxrLoader:
 
         if self.data["is_saturated"].sum() > 0:
             warnings.warn(
-                "The CCD was likely saturated during data collection. Stitching may be impacted"
+                "The CCD was likely saturated. Stitching may be impacted",
+                stacklevel=2,
             )
 
-        scans = (
+        _scans = (
             self.data["scan"].iloc[-1] + 1
         )  # How many total scans are included in each calculation? (starts at 0)
         self.data = (
@@ -886,12 +896,14 @@ class PrsoxrLoader:
         )
         self.data["R"] = self.data.apply(lambda df: df["R"] / df["scale"], axis=1)
         # self.data['R_err'] = self.data.apply(
-        #    lambda df: df['R'] * ((df['R_err']/df['R'])**2 + (df['scale_err']/df['scale'])**2)**0.5,
+        #   lambda df: (
+        #       df['R'] * ((df['R_err']/df['R'])**2
+        # + (df['scale_err']/df['scale'])**2)**0.5) ,
         #   axis=1
         # )
         # Generate output mask
         mask = self.data["i0_mask"] < 1
-        mask &= self.data["is_saturated"] == False
+        mask &= not self.data["is_saturated"]
         mask &= self.data["R"] > 0
         if self.process_vars["drop_failed_stitch"]:
             mask &= self.data["failed_stitch_mask"] < 1
@@ -916,7 +928,10 @@ class PrsoxrLoader:
             i0_err = df["counts_err"].loc[:i0_cutoff].std()
         except IndexError:
             print(
-                f"No direct beam found for scan #{df['fits_index'].iloc[0]}. Not normalizing the beam."
+                f"""
+                No direct beam found for scan #{df["fits_index"].iloc[0]}.
+                Not normalizing the beam.
+                """
             )
             print(np.abs(df["sam_z"].diff()) > 0.1)
             i0 = 1
@@ -957,7 +972,7 @@ class PrsoxrLoader:
                         skip = False
                         skip_count = 0
                 elif abs(val) > self.process_vars["stitch_mark_tol"]:
-                    if df["mark"].iloc[i] == None:
+                    if df["mark"].iloc[i] is None:
                         df.loc[igroup + i + 1, "mark"] = (
                             1  # adds to the 'next' position
                         )
@@ -979,14 +994,14 @@ class PrsoxrLoader:
         linear = Model(stitchratio)
         prev_mark_index = 0
         for i in range(len(df)):  # row in df.iterrows():
-            if df["mark"].iloc[i] == None:
+            if df["mark"].iloc[i] is None:
                 continue
 
             # If here, we are at a stitch point
             sam_th_stitch = df["sam_th"].iloc[i]
             # Calculate the number of datapoints are repeated.
             repeat = 0
-            for j, val in enumerate(df["sam_th"].iloc[i:]):
+            for val in df["sam_th"].iloc[i:]:
                 if (
                     val == sam_th_stitch
                 ):  # I have entered a region where qstitch matches the value
@@ -1005,7 +1020,7 @@ class PrsoxrLoader:
                 if val in df["sam_th"].iloc[i + repeat :].values and jj not in ipre:
                     if df["is_saturated"].iloc[jj]:
                         print(
-                            f"Saturation found in pre-change stitch point, dropping index: {jj}"
+                            f"Saturation found in pre-change stitch point, dropping: {jj}"  # noqa: E501
                         )
                     else:
                         ipre.append(jj)
@@ -1017,7 +1032,7 @@ class PrsoxrLoader:
                 if val in df["sam_th"].iloc[ipre].values and jj not in ipost:
                     if df["is_saturated"].iloc[jj]:
                         print(
-                            f"Saturation found in post-change stitch point, dropping index: {jj}"
+                            f"Saturation found in post-change stitch point, dropping index: {jj}"  # noqa: E501
                         )
                     else:
                         ipost.append(jj)
@@ -1025,14 +1040,14 @@ class PrsoxrLoader:
             #    drop_points = []
             #    maxcounts = int(df['zinged_image'].iloc[j].max())
             #    if np.abs(maxcounts - 65535) < 2:
-            #        print(f"Saturation found in pre-change stitch point, dropping index: {j}")
+            #        print(f"Saturation found in pre-change stitch point, dropping index: {j}")  # noqa: E501
             #        drop_points.append(j)
             # ipre = [index for index in ipre if index not in drop_points]
             # for j in ipost:
             #    drop_points = []
             #    maxcounts = int(df['zinged_image'].iloc[j].max())
             #    if np.abs(maxcounts - 65535) < 2:
-            #        print(f"Saturation found in post-change stitch point, dropping index: {j}")
+            #        print(f"Saturation found in post-change stitch point, dropping index: {j}")  # noqa: E501
             #        drop_points.append(j)
             # ipost = [index for index in ipost if index not in drop_points]
 
@@ -1067,7 +1082,10 @@ class PrsoxrLoader:
             # We successfully found a stitch point and are moving on.
             if len(safe_stitch_values) == 1:
                 warnings.warn(
-                    f"The scan starting with index {df['fits_index'].iloc[0]} only has one stitch point."
+                    f"""
+                    The scan starting with index {df["fits_index"].iloc[0]}
+                    only has one stitch point.""",
+                    stacklevel=2,
                 )
 
             # Proceed with stitching
@@ -1081,13 +1099,12 @@ class PrsoxrLoader:
             scale_erri = stitch_output.sd_beta[0]
 
             df.loc[igroup + i :, "scale"] = (
-                df["scale"].iloc[i:].apply(lambda x: x * scalei)
+                df["scale"].iloc[i:].apply(lambda x, si=scalei: x * si)
             )
             df.loc[igroup + i :, "scale_err"] = df.iloc[i:].apply(
-                lambda x: (
+                lambda x, si=scalei, se=scale_erri: (
                     x["scale"]
-                    * ((x["scale_err"] / x["scale"]) ** 2 + (scale_erri / scalei) ** 2)
-                    ** 0.5
+                    * ((x["scale_err"] / x["scale"]) ** 2 + (se / si) ** 2) ** 0.5
                 ),
                 axis=1,
             )

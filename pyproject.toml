@@ -90,6 +90,7 @@ line-length = 88
 src = ["src", "tests"]
 
 [tool.ruff.lint]
+ignore = ["ERA001"] # Ignore "eradicate" errors (e.g., unused imports)
 select = [
     "E",      # pycodestyle errors
     "W",      # pycodestyle warnings
