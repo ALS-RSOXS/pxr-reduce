@@ -1,0 +1,243 @@
+# How-to guide
+
+Practical recipes for operating `pxr-reduce`, from the command line and from
+Python. For the meaning of each parameter see the
+[Configuration reference](configuration.md); for signatures see the
+[API reference](api-reference.md).
+
+---
+
+## 1. Command line
+
+The CLI is the fastest way to reduce a folder without opening a notebook.
+
+### Setup
+
+```bash
+# Option A — run from the repo without installing
+cd /path/to/pxr-reduce
+uv run pxr-reduce run "path/to/data"
+
+# Option B — install once, run from anywhere
+uv tool install --editable /path/to/pxr-reduce
+pxr-reduce run "path/to/data"
+```
+
+Paths with spaces must be quoted: `pxr-reduce run "D:/ALS/2020 Nov/MF114A"`.
+
+### Reduce a folder
+
+```bash
+pxr-reduce run "path/to/data"
+```
+
+- Globs `*.fits` in the folder, infers the sample name and frame order from the
+  filenames, processes and reduces, then writes outputs to **`./results`**
+  (relative to your current directory — *not* the data folder).
+- Produces `results/<sample>.dat` and a `results/<sample>_plots/` folder with one
+  I-vs-q PNG per (energy, polarization).
+
+### Preview before writing
+
+```bash
+pxr-reduce run "path/to/data" --dry-run -v
+```
+
+`--dry-run` loads, processes, and reduces (so you see the real point count) but
+writes nothing. `-v` adds INFO/DEBUG logging (frame counts, beam region size,
+fitted ROI, etc.). This is the recommended first command on any new dataset.
+
+### Fast previews
+
+```bash
+# Skip stitch scaling (avoids overlap pitfalls), skip plots
+pxr-reduce run "path/to/data" --quick --no-plots
+
+# Also skip the median-filter/dezinger step and load every 4th frame
+pxr-reduce run "path/to/data" --quick --no-dezinger --subsample 4
+```
+
+| Flag | Effect |
+|---|---|
+| `--quick` | Skip stitch detection/scaling; reflectivity is i0-normalized only. |
+| `--no-dezinger` | Skip median-filter/dezinger (much faster, noisier). |
+| `--subsample N` | Load every Nth frame. |
+| `--no-plots` | Do not export PNGs. |
+| `--no-dedup` | Do not average duplicate (theta, energy, polarization) points. |
+
+### Size the ROI from the direct beam
+
+```bash
+pxr-reduce run "path/to/data" --fit-roi --roi-n-sigma 3
+```
+
+Fits the direct-beam (i0) frames to 2D moments and sizes the beam ROI to
+±`roi-n-sigma` of the fitted beam width. See
+[ROI from the direct beam](#5-size-the-roi-from-the-direct-beam).
+
+### Choosing the output location
+
+```bash
+pxr-reduce run "path/to/data" --results-dir "reduced/run1"   # relative to cwd
+pxr-reduce run "path/to/data" -o "D:/analysis/MF114A.dat"    # explicit .dat path
+```
+
+### Other useful flags
+
+```bash
+pxr-reduce run "path/to/data" \
+    --detector cmos_11012 \
+    --roi-height 40 --roi-width 40 \
+    --energy-offset 0.2 \
+    --sam-th-offset -0.01 \
+    --pattern "*.fits"
+```
+
+ROI flags override the config default only when supplied; otherwise the
+`ReductionConfig` defaults are used. See `pxr-reduce run --help` for the full list.
+
+### List detectors
+
+```bash
+pxr-reduce list-detectors
+```
+
+---
+
+## 2. Python API
+
+Full control lives in the `PXRLoader` class.
+
+```python
+from pathlib import Path
+from pxr_reduce import PXRLoader, ReductionConfig
+
+files = list(Path("path/to/data").glob("*.fits"))
+
+config = ReductionConfig(
+    detector="cmos_11012",
+    roi_height=40,
+    roi_width=40,
+)
+
+loader = PXRLoader(files, config)   # loads metadata; images loaded lazily
+loader.process()                    # build mask, integrate every frame
+refl = loader.reduce()              # -> DataFrame of the 1D reflectivity curve
+```
+
+`reduce()` returns a pandas DataFrame with columns `scan, energy, polarization,
+sam_th, q, R, R_err`.
+
+### Quick reduction (no scaling)
+
+```python
+preview = loader.reduce(apply_scale=False)   # i0-normalized only, no stitching
+```
+
+### Rebuild any image for debugging
+
+Images are not kept in the table; pull them on demand:
+
+```python
+raw = loader.get_image(42)          # raw frame for fits_index 42
+clean = loader.get_clean_image(42)  # trimmed + dezingered
+```
+
+---
+
+## 3. Examine frames with the viewer
+
+Query frames by metadata and inspect them with beam/ROI overlays.
+
+```python
+# Which frames match some metadata?
+subset = loader.query(energy=250.0, sam_th=(0.0, 5.0))   # tuple = inclusive range
+
+# Render a single frame (headless Figure; good for scripts/notebooks)
+from pxr_reduce.viewer import frame_figure
+fig = frame_figure(loader, fits_index=42)
+fig.savefig("frame42.png")
+
+# Interactive browser: cycle through a metadata selection with Prev/Next buttons
+from pxr_reduce.viewer import FrameBrowser
+FrameBrowser(loader, energy=250.0, sam_th=(0.0, 5.0)).show()
+```
+
+The viewer shows the cleaned image (log scale), the integration mask, the beam
+position, the beam and dark ROI boxes, and a side panel of scalar readouts
+(raw counts, reduced intensity, SNR, saturation).
+
+---
+
+## 4. Export results
+
+```python
+from pxr_reduce import ReducedDataset
+
+dataset = ReducedDataset.from_loader(loader)
+
+# Write .dat + a sibling <stem>_plots/ folder
+dataset.save("results/MF114A.dat")
+
+# Or write the parts separately
+dataset.save_dat("results/MF114A.dat")
+dataset.save_plots("results/MF114A_plots")
+
+# Preview only
+dataset.save("results/MF114A.dat", dry_run=True)
+```
+
+The `.dat` file is tab-delimited with a `#`-commented provenance header:
+software version + git commit, collection vs. reduction timestamps, the full
+config and detector spec, the fitted ROI/beam sigma (if used), energies and
+polarizations present, and the uncertainty model. It reads back cleanly with
+`pandas.read_csv(path, sep="\t", comment="#")`.
+
+### Combine two datasets (e.g. two polarizations)
+
+```python
+spol = ReducedDataset.from_loader(loader_spol)
+ppol = ReducedDataset.from_loader(loader_ppol)
+
+combined = spol.combine(ppol)          # or ReducedDataset.combine_all([a, b, c])
+combined.save("results/MF114A_both.dat")
+```
+
+The combined header preserves the provenance of **every** source, so a single
+file documents all inputs.
+
+---
+
+## 5. Size the ROI from the direct beam
+
+To avoid accidentally integrating non-specular signal, size the ROI from the
+shape of the direct beam (i0) rather than a fixed rectangle:
+
+```python
+config = ReductionConfig(roi_from_beam_fit=True, roi_n_sigma=3.0)
+loader = PXRLoader(files, config)
+loader.process()
+
+print(loader.beam_shape)              # fitted sigma_y, sigma_x, centroid, ...
+print(loader.config.roi_height, loader.config.roi_width)  # ROI set from the fit
+```
+
+`process()` fits the direct-beam frames with 2D moments, aggregates them (median),
+and sets the ROI to ±`roi_n_sigma` of the fitted width. Saturated i0 frames are
+skipped; if no usable direct-beam frames are found it falls back to the configured
+ROI and warns. The fitted sigma and ROI are recorded in the export header.
+
+---
+
+## 6. Tips and troubleshooting
+
+- **Run `--dry-run -v` first.** Confirm the sample name, frame count, beam-region
+  size, and reduced point count look right before writing.
+- **Check the ROI visually.** Open a frame in the viewer to confirm the beam/dark
+  boxes land on the beam and background.
+- **"only has one stitch point" warning** is informational — it flags scans where
+  the scale factor rests on a single overlap angle.
+- **Slow on a network drive?** Reading full frames over a network is I/O-bound;
+  copy the data locally, or ask about lazy section reads.
+- **`R_err` looks non-physical.** Detector noise parameters are placeholders until
+  measured values are supplied (see [Configuration](configuration.md#detector)).

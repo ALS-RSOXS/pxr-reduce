@@ -1,10 +1,16 @@
 import numpy as np
+from numpy.typing import NDArray
 from scipy.ndimage import median_filter
 
 
 # Replace pixels above a threshold with the average defined by a box of SIZE x SIZE around the pixel
 # -- From Jan Ilavsky's IGOR implementation.
-def dezinger_image(image, med_result=None, threshold=10, size=3):
+def dezinger_image(
+    image: NDArray[np.floating],
+    med_result: NDArray[np.floating] | None = None,
+    threshold: float = 10,
+    size: int = 3,
+) -> NDArray[np.floating]:
     """
     Function to remove potential hot pixels during data collection.
     Replaces pixels that have intensity greater than threshold above its nearest neighbors
@@ -29,8 +35,15 @@ def dezinger_image(image, med_result=None, threshold=10, size=3):
         med_result = median_filter(
             image, size=size
         )  # Apply Median Filter to image if needed
-    # Calculate Ratio of each pixel to compared to a threshold
-    diff_image = image / np.abs(med_result)
+    # Calculate ratio of each pixel to its median-filtered value; where the
+    # median is zero (flat background) there is nothing to dezinger, so leave the
+    # ratio at zero rather than dividing by zero.
+    diff_image = np.divide(
+        image,
+        np.abs(med_result),
+        out=np.zeros_like(image, dtype=float),
+        where=med_result != 0,
+    )
     # Repopulate image by removing pixels that exceed the threshold
     zinged_image = image * np.greater(threshold, diff_image).astype(
         int

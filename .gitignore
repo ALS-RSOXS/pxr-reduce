@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# pxr-reduce outputs
+#   Default output folder for `pxr-reduce run` (created in the current directory).
+results/
+#   Synthetic data written by the tutorial notebook.
+_tutorial_data/

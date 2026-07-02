@@ -1,7 +1,7 @@
 [project]
 name = "pxr-reduce"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Tools for reducing polarized X-ray reflectivity data from the RSoXS beamline at the ALS."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -11,9 +11,28 @@ dependencies = [
     "pandas>=3.0.1",
     "scipy>=1.17.1",
     "tqdm>=4.67.3",
+    "typer>=0.12.0",
 ]
+
+[project.scripts]
+pxr-reduce = "pxr_reduce.cli:app"
 
 [dependency-groups]
 dev = [
     "ruff>=0.15.5",
+]
+test = [
+    "pytest>=8.3.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = [
+    # Beamline FITS keywords exceed 8 chars; astropy stores them as HIERARCH cards.
+    "ignore:Keyword name.*HIERARCH:astropy.io.fits.verify.VerifyWarning",
 ]
