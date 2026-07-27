@@ -67,7 +67,7 @@ corresponding `ReductionConfig` default (see the
 [Configuration reference](docs/configuration.md)):
 
 ```bash
-pxr-reduce run "D:/ALS/2020 Nov/MF114A/spol" \
+pxr-reduce run "path/to/pxr/data" \
     --detector cmos_11012 \
     --roi-height 30 --roi-width 30 \
     --energy-offset 0.2 \
