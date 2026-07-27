@@ -7,6 +7,7 @@ from pxr_reduce.image_ops import (
     build_series_mask,
     clean_image,
     dark_roi_slices,
+    dezinger,
     integrate_frame,
     locate_beam,
     roi_slices,
@@ -35,6 +36,16 @@ def test_clean_image_skips_dezinger_when_disabled():
     out = clean_image(img, cfg)
     assert out.shape == (40, 40)
     assert out[20, 20] == 9999.0  # trimmed coords of (25,25)
+
+
+def test_dezinger_threshold_controls_aggressiveness():
+    # A pixel ~6x its local background: removed at threshold 5, kept at threshold 10.
+    img = np.full((15, 15), 100.0)
+    img[7, 7] = 600.0
+    aggressive = dezinger(img, ReductionConfig(dezinger_threshold=5.0, filter_size=3))
+    lenient = dezinger(img, ReductionConfig(dezinger_threshold=10.0, filter_size=3))
+    assert aggressive[7, 7] < 600.0  # replaced by local median (~100)
+    assert lenient[7, 7] == 600.0  # below 10x median -> kept
 
 
 def test_build_series_mask_dilates_hot_region():

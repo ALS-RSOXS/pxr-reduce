@@ -12,12 +12,15 @@ which detector to use.
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from pxr_reduce.detectors import DetectorSpec, get_detector
 
 DarkSide = Literal["LHS", "RHS"]
+BeamLocator = Literal["peak", "centroid"]
 
 
 @dataclass
@@ -43,18 +46,40 @@ class ReductionConfig:
         filter_size: Median-filter kernel size for image cleanup.
         dezinger: If True, median-filter and dezinger each image; if False, skip
             it for a much faster (but noisier) reduction.
+        dezinger_threshold: A pixel is replaced by its local median when it
+            exceeds this multiple of that median. Lower values remove hot pixels
+            more aggressively (10 = replace pixels >10x the local median).
         mask_threshold: Counts marking likely beam locations for masking.
         mask_max_frames: Cap on how many frames are read to build the integration
             mask; frames are evenly subsampled above this count (0 = use all).
-        drift_distance: Max beam drift radius (pixels) allowed between frames.
+        drift_distance: Beam search radius (pixels): how far the beam may move
+            between consecutive frames. Beam tracking searches within this radius
+            of the previous frame's position.
         dark_pix_offset: Pixel offset of the dark ROI from the beam ROI.
         darkside: Preferred side ("LHS"/"RHS") to sample the dark ROI.
         saturate_threshold: Distance (ADU) from detector saturation that flags a
             frame as saturated.
+        beam_snr_min: Minimum peak-to-noise ratio for a frame's beam to be
+            considered detected; below this the frame is a dropout and its
+            position is interpolated from the trajectory.
+        track_smoothing: If True, fit a smooth trajectory per scan and replace
+            dropouts/outliers with interpolated positions.
+        track_poly_order: Polynomial order for the trajectory fit.
+        centroid_radius: Half-size (px) of the window around the beam peak used to
+            compute the centroid position. Smaller values lock more tightly to the
+            peak so nearby scatter cannot pull the ROI off the beam.
         stitch_cutoff: Minimum spot/dark ratio for a point to be stitch-eligible.
         stitch_mark_tol: Minimum tracked-motor motion marking a stitch boundary.
         new_scan_marker: ``sam_th`` jump (deg) that marks the start of a new scan.
         drop_failed_stitch: Drop points that fail to stitch.
+        stitch_condition_columns: Metadata columns whose change (beyond
+            ``stitch_condition_tol``) marks a stitch boundary, alongside a
+            ``sam_th`` back-step. Missing columns are ignored.
+        stitch_condition_tol: A watched column must change by more than this to
+            count as a condition change (metadata is pre-rounded, so 0.0 means
+            "any real change").
+        stitch_theta_backstep: A ``sam_th`` decrease larger than this (deg)
+            between consecutive reflectivity frames marks a stitch boundary.
         roi_from_beam_fit: If True, size the ROI from a moments fit of the direct
             beam (i0) frames instead of using ``roi_height``/``roi_width``.
         roi_n_sigma: ROI half-extent in beam sigmas when ``roi_from_beam_fit``.
@@ -76,14 +101,21 @@ class ReductionConfig:
     roi_width: int = 40
     trim_x: int = 20
     trim_y: int = 20
-    filter_size: int = 3
+    filter_size: int = 5
     dezinger: bool = True
-    mask_threshold: int = 90
+    dezinger_threshold: float = 10.0
+    mask_threshold: int = 80
     mask_max_frames: int = 200
-    drift_distance: int = 25
-    dark_pix_offset: int = 20
+    drift_distance: int = 45
+    dark_pix_offset: int = 50
     darkside: DarkSide = "LHS"
     saturate_threshold: float = 2.0
+
+    # --- Beam tracking --------------------------------------------------------
+    beam_snr_min: float = 3.0
+    track_smoothing: bool = True
+    track_poly_order: int = 3
+    centroid_radius: int = 8
 
     # --- ROI from direct-beam (i0) shape --------------------------------------
     roi_from_beam_fit: bool = False
@@ -96,13 +128,33 @@ class ReductionConfig:
     new_scan_marker: float = 15.0
     drop_failed_stitch: bool = True
 
+    # --- Stitch-boundary detection --------------------------------------------
+    stitch_condition_columns: tuple[str, ...] = (
+        "hos",
+        "exposure",
+        "slits_vert",
+        "slits_horz",
+    )
+    stitch_condition_tol: float = 0.0
+    stitch_theta_backstep: float = 0.001
+
     def __post_init__(self) -> None:
+        # Normalize to a tuple so a JSON round-trip (which yields a list) still
+        # compares equal to the in-memory config.
+        self.stitch_condition_columns = tuple(self.stitch_condition_columns)
         if self.darkside not in ("LHS", "RHS"):
             raise ValueError(f"darkside must be 'LHS' or 'RHS', got {self.darkside!r}")
         if self.energy_resolution <= 0:
             raise ValueError("energy_resolution must be positive.")
         if self.roi_height <= 0 or self.roi_width <= 0:
             raise ValueError("roi_height and roi_width must be positive.")
+        if self.centroid_radius <= 0:
+            raise ValueError("centroid_radius must be positive.")
+        if self.dezinger_threshold <= 1:
+            raise ValueError(
+                "dezinger_threshold must be > 1 (it is a multiple of the local "
+                "median; values <= 1 would replace the beam itself)."
+            )
 
     def detector_spec(self) -> DetectorSpec:
         """Resolve :attr:`detector` to a concrete :class:`DetectorSpec`."""
@@ -119,3 +171,55 @@ class ReductionConfig:
         data.pop("detector", None)
         data.update(self.detector_spec().to_header_dict())
         return data
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a round-trippable dict of all fields (detector as its name).
+
+        Unlike :meth:`to_header_dict`, this preserves the ``detector`` field so
+        the config can be reconstructed with :meth:`from_dict`.
+        """
+        data = asdict(self)
+        detector = self.detector
+        data["detector"] = detector if isinstance(detector, str) else detector.name
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ReductionConfig:
+        """Construct a config from a dict produced by :meth:`to_dict`.
+
+        Unknown keys are ignored so configs written by a newer version load
+        (best-effort) under an older one.
+
+        Args:
+            data: Mapping of field names to values.
+
+        Returns:
+            The reconstructed configuration.
+        """
+        fields = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in fields})
+
+    def save_json(self, path: Path | str) -> Path:
+        """Write the config to a JSON file (for the CLI ``--config`` option).
+
+        Args:
+            path: Destination path.
+
+        Returns:
+            The path written.
+        """
+        path = Path(path)
+        path.write_text(json.dumps(self.to_dict(), indent=2))
+        return path
+
+    @classmethod
+    def load_json(cls, path: Path | str) -> ReductionConfig:
+        """Load a config from a JSON file written by :meth:`save_json`.
+
+        Args:
+            path: Path to the JSON file.
+
+        Returns:
+            The loaded configuration.
+        """
+        return cls.from_dict(json.loads(Path(path).read_text()))

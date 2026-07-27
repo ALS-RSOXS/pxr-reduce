@@ -57,6 +57,15 @@ def run(
         ..., exists=True, file_okay=False, help="Folder containing .fits files."
     ),
     pattern: str = typer.Option("*.fits", "--pattern", help="Glob for FITS files."),
+    config_path: Path | None = typer.Option(
+        None,
+        "--config",
+        exists=True,
+        dir_okay=False,
+        help="Load a ReductionConfig from a JSON file (e.g. from the tuning "
+        "notebook). Config-setting flags below are ignored when this is given; "
+        "--roi-height/--roi-width still override it.",
+    ),
     output: Path | None = typer.Option(
         None,
         "--output",
@@ -126,15 +135,19 @@ def run(
     from pxr_reduce.core import PXRLoader
     from pxr_reduce.dataset import ReducedDataset
 
-    config = ReductionConfig(
-        detector=detector,
-        energy_offset=energy_offset,
-        sam_th_offset=sam_th_offset,
-        dezinger=not no_dezinger,
-        roi_from_beam_fit=fit_roi,
-        roi_n_sigma=roi_n_sigma,
-    )
-    # Only override ROI defaults when the flags are explicitly provided.
+    if config_path is not None:
+        typer.echo(f"Loading reduction config from {config_path}")
+        config = ReductionConfig.load_json(config_path)
+    else:
+        config = ReductionConfig(
+            detector=detector,
+            energy_offset=energy_offset,
+            sam_th_offset=sam_th_offset,
+            dezinger=not no_dezinger,
+            roi_from_beam_fit=fit_roi,
+            roi_n_sigma=roi_n_sigma,
+        )
+    # ROI flags override in both cases (handy for a quick tweak of a saved config).
     if roi_height is not None:
         config.roi_height = roi_height
     if roi_width is not None:

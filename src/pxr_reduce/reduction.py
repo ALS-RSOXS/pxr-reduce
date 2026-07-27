@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import warnings
 from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -34,14 +35,8 @@ from pxr_reduce.config import ReductionConfig
 
 logger = logging.getLogger(__name__)
 
-# Motors whose motion marks a stitch boundary. ``sam_th`` is directional (a
-# decrease marks a stitch); other motors use absolute motion.
-STITCH_MOTORS: list[str] = ["sam_th"]
-
-# sam_th must decrease by more than this (deg) to count as a stitch boundary.
-_SAM_TH_STITCH_DROP = 0.2
-# Frames to skip after marking a stitch, to avoid re-marking the same move.
-_STITCH_SKIP_RESET = 2
+# Tolerance for comparing pre-rounded metadata values (angles, conditions).
+_FLOAT_EPS = 1e-9
 
 
 def stitch_ratio_model(r: np.ndarray, scale: float) -> np.ndarray:
@@ -115,20 +110,43 @@ def normalize_scan(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
         The group with ``R``, ``R_err``, and ``i0_mask`` columns added.
     """
     df = df.copy()
-    try:
-        move_positions = df.index[df["sam_z"].diff().abs() > metadata.SAM_Z_BEAM_MOVE]
-        i0_cutoff = int(move_positions[0]) + 1
-        i0 = df["counts_refl"].loc[:i0_cutoff].mean()
-        i0_err = df["counts_err"].loc[:i0_cutoff].std()
-    except IndexError:
+    scan_id = df["fits_index"].iloc[0] if "fits_index" in df else "?"
+    positions = df.index.to_numpy()
+    saturated = (
+        df["is_saturated"].to_numpy().astype(bool)
+        if "is_saturated" in df.columns
+        else np.zeros(len(df), dtype=bool)
+    )
+
+    move_positions = df.index[df["sam_z"].diff().abs() > metadata.SAM_Z_BEAM_MOVE]
+    if len(move_positions) == 0:
         logger.warning(
             "No direct beam found for scan starting at fits_index %s; not normalizing.",
-            df["fits_index"].iloc[0] if "fits_index" in df else "?",
+            scan_id,
         )
-        i0, i0_err, i0_cutoff = 1.0, 0.0, 0
+        move_position = 0
+    else:
+        move_position = int(move_positions[0])
+
+    # Direct-beam frames are those strictly before the sample moves into the beam.
+    direct = positions < move_position
+    usable = direct & ~saturated
+
+    i0, i0_err = 1.0, 0.0
+    if usable.any():
+        counts = df.loc[usable, "counts_refl"]
+        i0 = float(counts.mean())
+        i0_err = float(counts.std(ddof=1) / np.sqrt(usable.sum())) if usable.sum() > 1 else 0.0
+    elif direct.any():
+        logger.warning(
+            "All direct-beam frames for scan %s are saturated; I0 is clipped and "
+            "R will be under-normalized. Use an attenuated direct-beam measurement.",
+            scan_id,
+        )
+        i0 = float(df.loc[direct, "counts_refl"].mean())
 
     if i0 == 0 or np.isnan(i0):
-        logger.warning("I0 evaluated to %s; falling back to 1.0.", i0)
+        logger.warning("I0 evaluated to %s for scan %s; falling back to 1.0.", i0, scan_id)
         i0, i0_err = 1.0, 0.0
 
     df["R"] = df["counts_refl"] / i0
@@ -136,49 +154,86 @@ def normalize_scan(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
         df["counts_refl"] != 0, df["counts_err"] / df["counts_refl"], 0.0
     )
     df["R_err"] = np.abs(df["R"]) * np.sqrt(rel_counts**2 + (i0_err / i0) ** 2)
-    df["i0_mask"] = (df.index < i0_cutoff).astype(int)
+    df["i0_mask"] = direct.astype(int)
     return df
 
 
 def mark_stitch_points(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
     """Mark the frames at which a stitch (overlap) boundary begins.
 
+    A boundary is detected between consecutive *reflectivity* frames (direct-beam
+    i0 frames are excluded via ``i0_mask``) when either the sample angle steps
+    back into already-measured territory (``sam_th`` decreases by more than
+    ``config.stitch_theta_backstep``) or a watched condition column
+    (``config.stitch_condition_columns``) changes by more than
+    ``config.stitch_condition_tol``. The first reflectivity frame is never a
+    boundary, so the i0->first-measurement transition — which can step either way
+    because of an angle offset — is never marked.
+
+    The motor-settling repeats and the re-measured overlap points that follow a
+    boundary are collapsed into a single boundary: once one is marked, no further
+    boundary is marked until ``sam_th`` climbs back above the previous segment's
+    maximum angle.
+
     Args:
-        df: One scan group (fresh index).
-        config: Reduction configuration (stitch-mark tolerance).
+        df: One scan group (fresh index). Must contain ``sam_th``; ``i0_mask`` and
+            the watched condition columns are used when present.
+        config: Reduction configuration (back-step and condition thresholds).
 
     Returns:
-        The group with ``mark`` (1 at a boundary) and ``motor`` columns added.
+        The group with ``mark`` (1 at a boundary, else None) and ``stitch_trigger``
+        (text describing what changed, e.g. ``"backstep+exposure"``) columns added.
     """
     df = df.copy()
     n = len(df)
     mark: list[int | None] = [None] * n
-    motor_of: list[str | None] = [None] * n
+    trigger: list[str | None] = [None] * n
 
-    for motor in STITCH_MOTORS:
-        values = df[motor].to_numpy()
-        if motor == "sam_th":
-            steps = np.diff(values) < -_SAM_TH_STITCH_DROP
+    sam_th = df["sam_th"].to_numpy(dtype=float)
+    if "i0_mask" in df.columns:
+        is_refl = df["i0_mask"].to_numpy() < 1
+    else:
+        is_refl = np.ones(n, dtype=bool)
+    refl = np.where(is_refl)[0]
+    if len(refl) < 2:
+        df["mark"] = mark
+        df["stitch_trigger"] = trigger
+        return df
+
+    watched = [c for c in config.stitch_condition_columns if c in df.columns]
+    cond_tol = config.stitch_condition_tol + _FLOAT_EPS
+    backstep_min = config.stitch_theta_backstep
+
+    prev = int(refl[0])
+    running_max = sam_th[prev]
+    overlap_until = running_max
+    in_overlap = False
+    # Compare only consecutive reflectivity frames; the first is never a boundary.
+    for raw_pos in refl[1:]:
+        pos = int(raw_pos)
+        if in_overlap:
+            # Stay in the settling/overlap region until we climb past the top of
+            # the previous segment (forward measurement has genuinely resumed).
+            if sam_th[pos] > overlap_until + _FLOAT_EPS:
+                in_overlap = False
         else:
-            steps = np.diff(values)
-
-        skip = False
-        skip_count = 0
-        for i, val in enumerate(steps):
-            if skip:
-                if skip_count <= _STITCH_SKIP_RESET:
-                    skip_count += 1
-                else:
-                    skip = False
-                    skip_count = 0
-            elif abs(val) > config.stitch_mark_tol:
-                if mark[i] is None:
-                    mark[i + 1] = 1
-                    motor_of[i + 1] = motor
-                skip = True
+            backstep = sam_th[pos] < sam_th[prev] - backstep_min
+            changed = [
+                c
+                for c in watched
+                if abs(float(df[c].iloc[pos]) - float(df[c].iloc[prev])) > cond_tol
+            ]
+            if backstep or changed:
+                reasons = (["backstep"] if backstep else []) + changed
+                mark[pos] = 1
+                trigger[pos] = "+".join(reasons)
+                overlap_until = running_max  # top of the just-finished segment
+                in_overlap = True
+        running_max = max(running_max, sam_th[pos])
+        prev = pos
 
     df["mark"] = mark
-    df["motor"] = motor_of
+    df["stitch_trigger"] = trigger
     return df
 
 
@@ -277,6 +332,14 @@ def compute_scale_factors(df: pd.DataFrame, config: ReductionConfig) -> pd.DataF
         pre_r = stitch_pre.groupby("sam_th")["R"].mean().loc[order].to_numpy()
         post_r = stitch_post.groupby("sam_th")["R"].mean().loc[order].to_numpy()
         scale_i, scale_err_i = _fit_scale_factor(pre_r, post_r)
+        logger.info(
+            "Stitch at theta %.4f (%s): %d overlap point(s), scale=%.4g +/- %.2g.",
+            sam_th.iloc[i],
+            df["stitch_trigger"].iloc[i] if "stitch_trigger" in df.columns else "?",
+            len(safe_values),
+            scale_i,
+            scale_err_i,
+        )
 
         prev_scale = df["scale"].iloc[i:].to_numpy()
         prev_scale_err = df["scale_err"].iloc[i:].to_numpy()
@@ -390,3 +453,64 @@ def reduce(
         df["failed_stitch_mask"] = 0
 
     return finalize(df, config, drop_duplicates=drop_duplicates)
+
+
+def diagnose_stitches(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
+    """Return a per-boundary stitch diagnostic table (no finalize, nothing dropped).
+
+    Runs normalize -> mark -> compute_scale_factors and reports, for every
+    detected stitch boundary, what triggered it, the settled before/after values
+    of the changed conditions, how many overlap points were used, and the fitted
+    scale factor. Use it to see why an expected stitch is missing or mis-scaled.
+
+    Args:
+        df: Processed metadata/counts table (as produced by
+            :meth:`~pxr_reduce.core.PXRLoader.process`).
+        config: Reduction configuration.
+
+    Returns:
+        One row per boundary with columns ``scan, fits_index, sam_th, energy,
+        polarization, trigger, conditions_changed, num_stitch_points, scale,
+        scale_err, failed``. Empty if no boundaries were detected.
+    """
+    normalized = _apply_per_scan(df, lambda g: normalize_scan(g, config))
+    marked = _apply_per_scan(normalized, lambda g: mark_stitch_points(g, config))
+    scaled = _apply_per_scan(marked, lambda g: compute_scale_factors(g, config))
+
+    watched = [c for c in config.stitch_condition_columns if c in scaled.columns]
+    rows: list[dict[str, Any]] = []
+    for scan_id, group in scaled.groupby("scan", sort=True):
+        g = group.reset_index(drop=True)
+        boundaries = [i for i in range(len(g)) if not pd.isna(g["mark"].iloc[i])]
+        for k, b in enumerate(boundaries):
+            nxt = boundaries[k + 1] if k + 1 < len(boundaries) else len(g)
+            # Settled values: last frame of the previous segment vs last of this
+            # one (both are steady measurement frames, past any motor settling).
+            changes = []
+            for c in watched:
+                before = float(g[c].iloc[b - 1])
+                after = float(g[c].iloc[nxt - 1])
+                if abs(after - before) > config.stitch_condition_tol + _FLOAT_EPS:
+                    changes.append(f"{c}: {before:g}->{after:g}")
+            rows.append(
+                {
+                    "scan": scan_id,
+                    "fits_index": (
+                        int(g["fits_index"].iloc[b]) if "fits_index" in g else b
+                    ),
+                    "sam_th": float(g["sam_th"].iloc[b]),
+                    "energy": float(g["energy"].iloc[b]) if "energy" in g else np.nan,
+                    "polarization": (
+                        float(g["polarization"].iloc[b])
+                        if "polarization" in g
+                        else np.nan
+                    ),
+                    "trigger": g["stitch_trigger"].iloc[b],
+                    "conditions_changed": ", ".join(changes),
+                    "num_stitch_points": int(g["num_stitch_points"].iloc[b]),
+                    "scale": float(g["scale"].iloc[b]),
+                    "scale_err": float(g["scale_err"].iloc[b]),
+                    "failed": bool(g["failed_stitch_mask"].iloc[b]),
+                }
+            )
+    return pd.DataFrame(rows)

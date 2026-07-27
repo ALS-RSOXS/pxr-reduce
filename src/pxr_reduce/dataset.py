@@ -9,6 +9,7 @@ single file that preserves both sources' metadata.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+from uncertainties.formatting import PDG_precision
 
 from pxr_reduce.provenance import (
     ReductionProvenance,
@@ -40,6 +42,83 @@ _COLUMN_UNITS = {
     "sam_th": "deg",
     "scan": "-",
 }
+
+# Decimal places to which sample-theta is trusted; also sets the assumed angular
+# step (10^-N deg) used to propagate an uncertainty onto q for export rounding.
+_ANGLE_DECIMALS = 4
+
+
+def _error_decimals(error: float) -> int | None:
+    """Decimal places a value should keep given its 1-sigma ``error``.
+
+    Applies the PDG significant-figure rule (1 or 2 figures depending on the
+    error's leading digits) via :func:`uncertainties.formatting.PDG_precision`,
+    then converts the retained significant figures into a decimal count.
+
+    Args:
+        error: The 1-sigma uncertainty of the value.
+
+    Returns:
+        The number of decimal places to round to (may be negative for large
+        errors), or None if the error is not usable (non-finite or <= 0).
+    """
+    if not math.isfinite(error) or error <= 0:
+        return None
+    n_sig, error_rounded = PDG_precision(abs(error))
+    if error_rounded <= 0:
+        return None
+    exponent = math.floor(math.log10(error_rounded))
+    return int(n_sig - 1 - exponent)
+
+
+def _round_to_decimals(value: float, decimals: int | None) -> str:
+    """Format ``value`` rounded to ``decimals`` places as a plain string.
+
+    Args:
+        value: The value to format.
+        decimals: Decimal places to keep; None keeps a general 6-figure
+            precision (used when no usable uncertainty is available).
+
+    Returns:
+        The formatted value, free of floating-point display noise.
+    """
+    if not math.isfinite(value):
+        return str(value)
+    if decimals is None:
+        return f"{value:.6g}"
+    if decimals <= 0:
+        return f"{round(value, decimals):.0f}"
+    return f"{value:.{decimals}f}"
+
+
+def _round_value_and_error(value: float, error: float) -> tuple[str, str]:
+    """Round a value and its uncertainty to a shared, PDG-justified precision."""
+    decimals = _error_decimals(error)
+    return _round_to_decimals(value, decimals), _round_to_decimals(error, decimals)
+
+
+def _q_uncertainty(q: float, sam_th_deg: float, angle_decimals: int) -> float:
+    """Propagate the angular step onto q via ``q = 4pi sin(theta) / lambda``.
+
+    Using ``dq/dtheta = q * cot(theta)`` avoids needing the wavelength: the
+    angular step (one unit in the last trusted decimal, ``10**-angle_decimals``
+    deg) is mapped onto a q uncertainty that sets q's export precision.
+
+    Args:
+        q: Momentum transfer in inverse angstroms.
+        sam_th_deg: Sample theta in degrees.
+        angle_decimals: Decimal places to which the angle is trusted.
+
+    Returns:
+        The 1-sigma q uncertainty (inverse angstroms), or NaN if theta is 0 (q
+        resolution is undefined there) or q is non-finite.
+    """
+    theta = math.radians(sam_th_deg)
+    sin_theta = math.sin(theta)
+    if sin_theta == 0 or not math.isfinite(q):
+        return float("nan")
+    step_rad = math.radians(10.0**-angle_decimals)
+    return abs(q * math.cos(theta) / sin_theta * step_rad)
 
 
 @dataclass
@@ -161,11 +240,58 @@ class ReducedDataset:
         cols = [c for c in _DAT_COLUMNS if c in self.data.columns]
         return self.data[cols]
 
-    def save_dat(self, path: Path | str, *, dry_run: bool = False) -> Path:
+    def _formatted_body(self, angle_decimals: int = _ANGLE_DECIMALS) -> pd.DataFrame:
+        """Return the export table with q/R/R_err/sam_th rounded for output.
+
+        Rounding is applied only to the exported copy; :attr:`data` keeps full
+        precision (so plots are unaffected). ``R`` is rounded to the precision
+        justified by ``R_err`` (PDG rule); ``q`` is rounded to the precision
+        justified by the angular step propagated onto it; ``sam_th`` is fixed to
+        ``angle_decimals`` places.
+
+        Args:
+            angle_decimals: Decimal places to which sample theta is trusted.
+
+        Returns:
+            A copy of the ordered data with those columns as formatted strings.
+        """
+        df = self._ordered_data().copy()
+        if "R" in df.columns and "R_err" in df.columns:
+            rounded = [
+                _round_value_and_error(r, e)
+                for r, e in zip(df["R"], df["R_err"], strict=True)
+            ]
+            df["R"] = [r for r, _ in rounded]
+            df["R_err"] = [e for _, e in rounded]
+        # q uses the still-numeric sam_th, so round q before formatting sam_th.
+        if "q" in df.columns and "sam_th" in df.columns:
+            df["q"] = [
+                _round_to_decimals(
+                    q, _error_decimals(_q_uncertainty(q, th, angle_decimals))
+                )
+                for q, th in zip(df["q"], df["sam_th"], strict=True)
+            ]
+        if "sam_th" in df.columns:
+            df["sam_th"] = [f"{v:.{angle_decimals}f}" for v in df["sam_th"]]
+        return df
+
+    def save_dat(
+        self,
+        path: Path | str,
+        *,
+        angle_decimals: int = _ANGLE_DECIMALS,
+        dry_run: bool = False,
+    ) -> Path:
         """Write the dataset to a tab-delimited ``.dat`` file with header.
+
+        Values are rounded to their significant figures on export: ``R`` to the
+        precision justified by ``R_err``, ``q`` to the precision justified by the
+        angular step, and ``sam_th`` to ``angle_decimals`` places.
 
         Args:
             path: Output path (``.dat`` suffix added if missing).
+            angle_decimals: Decimal places to which sample theta is trusted; also
+                sets the angular step propagated onto q for its rounding.
             dry_run: If True, log the target and write nothing.
 
         Returns:
@@ -173,13 +299,18 @@ class ReducedDataset:
         """
         path = Path(path).with_suffix(".dat")
         header = "\n".join(f"# {line}" for line in self.header_lines())
-        body = self._ordered_data().to_csv(sep="\t", index=False)
+        # lineterminator + newline are set explicitly: pandas emits "\r\n" by
+        # default and write_text would translate the "\n" again on Windows,
+        # yielding "\r\r\n" (a stray CR / blank line) per row. Force clean "\n".
+        body = self._formatted_body(angle_decimals).to_csv(
+            sep="\t", index=False, lineterminator="\n"
+        )
         content = f"{header}\n{body}"
         if dry_run:
             logger.info("[dry-run] Would write %d points to %s", len(self.data), path)
             return path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8", newline="\n")
         logger.info("Wrote %d points to %s", len(self.data), path)
         return path
 
@@ -209,7 +340,12 @@ class ReducedDataset:
         return written
 
     def save(
-        self, path: Path | str, *, plots: bool = True, dry_run: bool = False
+        self,
+        path: Path | str,
+        *,
+        plots: bool = True,
+        angle_decimals: int = _ANGLE_DECIMALS,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """Write the ``.dat`` file and (optionally) a sibling plots folder.
 
@@ -219,13 +355,15 @@ class ReducedDataset:
         Args:
             path: Output ``.dat`` path.
             plots: If True, also export I-vs-q PNGs.
+            angle_decimals: Decimal places to which sample theta is trusted (see
+                :meth:`save_dat`).
             dry_run: If True, log targets and write nothing.
 
         Returns:
             Mapping with keys ``dat`` (Path) and ``plots`` (list[Path]).
         """
         path = Path(path).with_suffix(".dat")
-        dat_path = self.save_dat(path, dry_run=dry_run)
+        dat_path = self.save_dat(path, angle_decimals=angle_decimals, dry_run=dry_run)
         plot_paths: list[Path] = []
         if plots:
             plot_dir = path.parent / f"{path.stem}_plots"

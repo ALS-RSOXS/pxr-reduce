@@ -12,6 +12,7 @@ dependencies = [
     "scipy>=1.17.1",
     "tqdm>=4.67.3",
     "typer>=0.12.0",
+    "uncertainties>=3.2",
 ]
 
 [project.scripts]
@@ -24,10 +25,20 @@ dev = [
 test = [
     "pytest>=8.3.0",
 ]
+notebook = [
+    "ipykernel>=6.29.0",
+    "ipywidgets>=8.1.0",
+    "plotly>=5.24.0",
+    "anywidget>=0.9.0",
+]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv]
+# Install dev, test, and notebook tooling by default with `uv sync`.
+default-groups = ["dev", "test", "notebook"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

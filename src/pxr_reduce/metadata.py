@@ -77,7 +77,9 @@ def direct_beam_mask(df: pd.DataFrame) -> pd.Series:
     for _, group in df.groupby("scan"):
         moved = group["sam_z"].diff().abs() > SAM_Z_BEAM_MOVE
         moved_positions = np.where(moved.to_numpy())[0]
-        cutoff = int(moved_positions[0]) + 1 if len(moved_positions) else 0
+        # Direct-beam frames are strictly before the sample moves in; the move
+        # frame itself is the first reflectivity point.
+        cutoff = int(moved_positions[0]) if len(moved_positions) else 0
         mask.loc[group.index[:cutoff]] = True
     return mask
 

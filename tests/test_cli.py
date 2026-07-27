@@ -73,3 +73,27 @@ def test_run_quick_mode(synthetic_scan_folder, tmp_path):
 def test_run_no_matching_files_errors(tmp_path):
     result = runner.invoke(app, ["run", str(tmp_path), "--pattern", "*.nope"])
     assert result.exit_code != 0
+
+
+def test_run_with_config_file(synthetic_scan_folder, tmp_path):
+    from pxr_reduce.config import ReductionConfig
+
+    folder = synthetic_scan_folder()
+    cfg_path = tmp_path / "tuned.json"
+    ReductionConfig(roi_height=9, roi_width=9, mask_threshold=90).save_json(cfg_path)
+    results = tmp_path / "results"
+    result = runner.invoke(
+        app,
+        ["run", str(folder), "--config", str(cfg_path),
+         "--results-dir", str(results), "--no-plots"],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert (results / "MF999A.dat").exists()
+
+
+def test_run_missing_config_file_errors(synthetic_scan_folder, tmp_path):
+    folder = synthetic_scan_folder()
+    result = runner.invoke(
+        app, ["run", str(folder), "--config", str(tmp_path / "nope.json")]
+    )
+    assert result.exit_code != 0

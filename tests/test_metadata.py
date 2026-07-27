@@ -120,11 +120,11 @@ def test_direct_beam_mask_per_scan():
             "sam_z": [0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0],
         }
     )
-    # Same i0 cutoff as normalization (index < move_position + 1):
-    # scan 0 moves at pos 2 -> cutoff 3 -> first 3 direct beam
-    # scan 1 moves at pos 1 -> cutoff 2 -> first 2 direct beam
+    # Direct beam is strictly before the sam_z move (same as normalization):
+    # scan 0 moves at pos 2 -> frames 0,1 direct
+    # scan 1 moves at pos 1 -> frame 0 direct
     mask = direct_beam_mask(df)
-    assert mask.tolist() == [True, True, True, False, True, True, False]
+    assert mask.tolist() == [True, True, False, False, True, False, False]
 
 
 def test_direct_beam_mask_no_move_marks_none():

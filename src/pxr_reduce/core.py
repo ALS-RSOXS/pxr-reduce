@@ -25,7 +25,7 @@ import pandas as pd
 from numpy.typing import NDArray
 from tqdm.auto import tqdm
 
-from pxr_reduce import beam_fit, image_ops, metadata, reduction
+from pxr_reduce import beam_fit, image_ops, metadata, reduction, tracking
 from pxr_reduce.beam_fit import BeamShape
 from pxr_reduce.config import ReductionConfig
 from pxr_reduce.io.fits_io import ImageStore, read_fits_header
@@ -79,6 +79,7 @@ class PXRLoader:
         self.sam_th_offset_applied: float = 0.0
         self.beam_shape: BeamShape | None = None
 
+        logger.info("Loading %d file(s) — reading headers...", len(files))
         paths = self._validate_files(files)
         index_regex = self._infer_naming(paths)
         self.name = self._infer_sample_name(paths[0], index_regex)
@@ -131,7 +132,7 @@ class PXRLoader:
 
     def _load_metadata(self, index_by_path: dict[Path, int]) -> pd.DataFrame:
         records: list[dict[str, Any]] = []
-        for p in tqdm(self.files, desc="Loading FITS headers"):
+        for p in tqdm(self.files, desc="Loading FITS headers", unit="file"):
             record = read_fits_header(p)
             record["fits_index"] = index_by_path[p]
             records.append(record)
@@ -155,6 +156,10 @@ class PXRLoader:
     def __call__(self, **kwargs: Any) -> pd.DataFrame:
         """Alias for :meth:`reduce`."""
         return self.reduce(**kwargs)
+
+    def path_for(self, fits_index: int) -> Path:
+        """Return the FITS file path for a frame index."""
+        return self._store.path(fits_index)
 
     def get_image(self, fits_index: int) -> NDArray[np.floating]:
         """Return the raw image for a frame index (lazy-loaded)."""
@@ -191,23 +196,24 @@ class PXRLoader:
     # -- Processing -----------------------------------------------------------
 
     def process(self) -> None:
-        """Build the integration mask, then integrate every frame.
+        """Track the beam per scan and integrate every frame.
 
-        The mask is built from raw frames (its mean is dezingered once) using at
-        most ``config.mask_max_frames`` evenly subsampled frames. Because the
-        beam-finder only searches within the mask, each frame is dezingered on
-        just the mask's bounding box rather than the full detector — giving the
-        same beam location and integration as full-frame cleaning at a fraction
-        of the cost. Memory stays flat: images are streamed.
+        A coarse static mask is built from subsampled raw frames (for display and
+        to bound the anchor search). Each scan is then tracked in acquisition
+        order: an anchor is located on the bright first frame, and each subsequent
+        frame's beam is found within ``drift_distance`` of the previous position
+        via an SNR-gated centroid. Faint frames become dropouts whose positions
+        are filled from a smoothed trajectory. Only a small region around the
+        beam is dezingered per frame, so memory and time stay bounded.
         """
         detector = self.config.detector_spec()
-        indices = [int(i) for i in self.data["fits_index"]]
+        tx, ty = self.config.trim_x, self.config.trim_y
+        all_indices = [int(i) for i in self.data["fits_index"]]
         exposures = dict(
             zip(self.data["fits_index"], self.data["exposure"], strict=True)
         )
-        tx, ty = self.config.trim_x, self.config.trim_y
 
-        mask_indices = _subsample(indices, self.config.mask_max_frames)
+        mask_indices = _subsample(all_indices, self.config.mask_max_frames)
         logger.info("Building integration mask from %d frame(s)", len(mask_indices))
         raw_stream = (
             image_ops.trim(self._store.get(i), tx, ty)
@@ -215,65 +221,217 @@ class PXRLoader:
         )
         self.mask = image_ops.build_series_mask(raw_stream, self.config)
 
-        def _bbox() -> tuple[slice, slice]:
-            pad = self.config.dark_pix_offset + 2 * max(
-                self.config.roi_height, self.config.roi_width
-            )
-            return image_ops.mask_bounding_box(self.mask, pad)
+        # Bounding box of the swept-beam region; the anchor is located within the
+        # mask so a weak first frame cannot lock onto a bright off-beam artifact.
+        anchor_pad = self.config.dark_pix_offset + 2 * max(
+            self.config.roi_height, self.config.roi_width
+        )
+        arow, acol = image_ops.mask_bounding_box(self.mask, anchor_pad)
+        anchor_mask = self.mask[arow, acol]
+        if not anchor_mask.any():
+            anchor_mask = None
 
-        # Dezinger/integrate only the padded mask bounding box: the beam-finder
-        # is constrained to the mask, so this yields identical results far faster.
-        row_sl, col_sl = _bbox()
-        sub_mask = self.mask[row_sl, col_sl]
-
-        # Optionally size the ROI from a moments fit of the direct-beam frames.
         if self.config.roi_from_beam_fit:
-            shape = self._fit_beam_shape(row_sl, col_sl, sub_mask, detector)
-            if shape is not None:
-                h, w = beam_fit.roi_from_shape(shape, self.config.roi_n_sigma)
-                logger.info(
-                    "ROI from i0 beam fit: %d x %d px (sigma_y=%.2f, sigma_x=%.2f)",
-                    h, w, shape.sigma_y, shape.sigma_x,
-                )
-                self.config.roi_height, self.config.roi_width = h, w
-                self.beam_shape = shape
-                row_sl, col_sl = _bbox()  # ROI changed -> refresh bounding box
-                sub_mask = self.mask[row_sl, col_sl]
-            else:
-                logger.warning(
-                    "Beam fit found no usable i0 frames; using configured ROI "
-                    "(%d x %d).",
-                    self.config.roi_height,
-                    self.config.roi_width,
-                )
+            self._maybe_fit_roi(arow, acol, detector)
 
+        # Per-frame region big enough to contain the search radius + beam/dark ROI.
+        region_half = (
+            self.config.drift_distance
+            + self.config.dark_pix_offset
+            + 2 * max(self.config.roi_height, self.config.roi_width)
+        )
         logger.info(
-            "Integrating frames (beam region %d x %d px of full frame)",
-            row_sl.stop - row_sl.start,
-            col_sl.stop - col_sl.start,
+            "Tracking beam (search radius %d px) and integrating %d frame(s)...",
+            self.config.drift_distance,
+            len(all_indices),
         )
 
-        results: list[image_ops.FrameIntegration] = []
-        for i in tqdm(indices, desc="Integrating frames"):
-            trimmed = image_ops.trim(self._store.get(i), tx, ty)
-            sub = trimmed[row_sl, col_sl]
-            cleaned_sub = image_ops.dezinger(sub, self.config)
-            frame = image_ops.integrate_frame(
-                cleaned_sub, sub_mask, self.config, detector, float(exposures[i])
+        # Direct-beam (i0) frames sit at a different detector position than the
+        # specular track, so they are integrated at their own global peak; only
+        # the reflectivity frames are tracked along the specular path.
+        is_direct = dict(
+            zip(
+                (int(i) for i in self.data["fits_index"]),
+                metadata.direct_beam_mask(self.data).to_numpy(),
             )
-            # Map the beam spot back to full trimmed-frame coordinates so viewer
-            # overlays and stored positions are consistent.
-            frame = replace(
-                frame,
-                beam_spot=(
-                    frame.beam_spot[0] + row_sl.start,
-                    frame.beam_spot[1] + col_sl.start,
-                ),
-            )
-            results.append(frame)
+        )
 
-        self._assemble_counts(results)
+        results: dict[int, image_ops.FrameIntegration] = {}
+        track: dict[int, tuple[tuple[int, int], bool, float]] = {}
+        for scan_id, group in self.data.groupby("scan", sort=True):
+            scan_indices = [int(i) for i in group.sort_values("fits_index")["fits_index"]]
+            direct_idx = [i for i in scan_indices if is_direct[i]]
+            refl_idx = [i for i in scan_indices if not is_direct[i]]
+
+            for idx in direct_idx:
+                beam, snr, frame = self._integrate_direct(
+                    idx, detector, float(exposures[idx])
+                )
+                results[idx], track[idx] = frame, (beam, True, snr)
+
+            if refl_idx:
+                prev = self._anchor(refl_idx[0], arow, acol, anchor_mask)
+                for idx in tqdm(refl_idx, desc=f"Scan {scan_id}", leave=False):
+                    beam, found, snr, frame = self._track_and_integrate(
+                        idx, prev, region_half, detector, float(exposures[idx])
+                    )
+                    results[idx], track[idx] = frame, (beam, found, snr)
+                    if found:
+                        prev = beam
+                if self.config.track_smoothing:
+                    self._smooth_and_reintegrate(
+                        refl_idx, track, results, region_half, detector, exposures
+                    )
+
+        self._assemble_counts([results[i] for i in all_indices])
+        self.data["beam_found"] = [track[i][1] for i in all_indices]
+        self.data["beam_snr"] = [track[i][2] for i in all_indices]
         self.data_processed = True
+
+    def _integrate_direct(
+        self, fits_index: int, detector: Any, exposure_s: float
+    ) -> tuple[tuple[int, int], float, image_ops.FrameIntegration]:
+        """Integrate a direct-beam (i0) frame at its own global peak.
+
+        The direct beam (sample out) is intense and sits at a different detector
+        position than the specular track, so it is located by the global peak of
+        the whole frame rather than the tracked position. Returns
+        ``(beam, snr, frame)`` with the beam in trimmed coordinates.
+        """
+        trimmed = image_ops.trim(
+            self._store.get(fits_index), self.config.trim_x, self.config.trim_y
+        )
+        cleaned = image_ops.dezinger(trimmed, self.config)
+        beam = tracking.anchor_position(cleaned)
+        res = tracking.locate_in_window(
+            cleaned,
+            beam,
+            self.config.drift_distance,
+            snr_min=0.0,
+            centroid_radius=self._centroid_radius(),
+        )
+        frame = image_ops.integrate_at(
+            cleaned, beam, self.config, detector, exposure_s
+        )
+        frame = replace(frame, beam_spot=beam)
+        return beam, res.snr, frame
+
+    def _centroid_radius(self) -> int:
+        """Half-size of the beam-centroid window (see ``config.centroid_radius``).
+
+        Keeps the centroid local to the beam peak so off-beam scatter within the
+        (larger) search radius does not pull the position.
+        """
+        return self.config.centroid_radius
+
+    def _anchor(
+        self,
+        fits_index: int,
+        arow: slice,
+        acol: slice,
+        anchor_mask: NDArray[np.bool_] | None,
+    ) -> tuple[int, int]:
+        """Locate the beam on the first frame of a scan to seed tracking.
+
+        Searches within the swept-beam mask (bounding box) so a weak first frame
+        cannot lock onto a brighter off-beam artifact. Returns the beam ``(y, x)``
+        in trimmed coordinates.
+        """
+        trimmed = image_ops.trim(
+            self._store.get(fits_index), self.config.trim_x, self.config.trim_y
+        )
+        cleaned = image_ops.dezinger(trimmed[arow, acol], self.config)
+        y, x = tracking.anchor_position(cleaned, anchor_mask)
+        return (y + arow.start, x + acol.start)
+
+    def _track_and_integrate(
+        self,
+        fits_index: int,
+        prev: tuple[int, int],
+        region_half: int,
+        detector: Any,
+        exposure_s: float,
+    ) -> tuple[tuple[int, int], bool, float, image_ops.FrameIntegration]:
+        """Find the beam near ``prev`` and integrate; returns (beam, found, snr, frame)."""
+        trimmed = image_ops.trim(self._store.get(fits_index), self.config.trim_x, self.config.trim_y)
+        region, oy, ox = image_ops.crop_region(trimmed, prev, region_half)
+        cleaned = image_ops.dezinger(region, self.config)
+        center = (prev[0] - oy, prev[1] - ox)
+        res = tracking.locate_in_window(
+            cleaned,
+            center,
+            self.config.drift_distance,
+            self.config.beam_snr_min,
+            centroid_radius=self._centroid_radius(),
+        )
+        beam_region = (res.y, res.x) if res.found else (
+            int(round(center[0])), int(round(center[1]))
+        )
+        frame = image_ops.integrate_at(
+            cleaned, beam_region, self.config, detector, exposure_s
+        )
+        beam_trimmed = (beam_region[0] + oy, beam_region[1] + ox)
+        frame = replace(frame, beam_spot=beam_trimmed)
+        return beam_trimmed, res.found, res.snr, frame
+
+    def _reintegrate_at(
+        self,
+        fits_index: int,
+        beam_trimmed: tuple[int, int],
+        region_half: int,
+        detector: Any,
+        exposure_s: float,
+    ) -> image_ops.FrameIntegration:
+        """Re-integrate a frame at a corrected (smoothed) beam position."""
+        trimmed = image_ops.trim(self._store.get(fits_index), self.config.trim_x, self.config.trim_y)
+        region, oy, ox = image_ops.crop_region(trimmed, beam_trimmed, region_half)
+        cleaned = image_ops.dezinger(region, self.config)
+        beam_region = (beam_trimmed[0] - oy, beam_trimmed[1] - ox)
+        frame = image_ops.integrate_at(
+            cleaned, beam_region, self.config, detector, exposure_s
+        )
+        return replace(frame, beam_spot=beam_trimmed)
+
+    def _smooth_and_reintegrate(
+        self,
+        scan_indices: list[int],
+        track: dict[int, tuple[tuple[int, int], bool, float]],
+        results: dict[int, image_ops.FrameIntegration],
+        region_half: int,
+        detector: Any,
+        exposures: dict[int, float],
+    ) -> None:
+        """Smooth a scan's trajectory and re-integrate corrected frames in place."""
+        positions = [track[i][0] for i in scan_indices]
+        found = [track[i][1] for i in scan_indices]
+        corrected = tracking.smooth_track(
+            positions, found, poly_order=self.config.track_poly_order
+        )
+        for idx, (newpos, changed) in zip(scan_indices, corrected):
+            if changed:
+                results[idx] = self._reintegrate_at(
+                    idx, newpos, region_half, detector, float(exposures[idx])
+                )
+                track[idx] = (newpos, track[idx][1], track[idx][2])
+
+    def _maybe_fit_roi(self, arow: slice, acol: slice, detector: Any) -> None:
+        """Size the ROI from the direct-beam moments fit, if enabled."""
+        shape = self._fit_beam_shape(arow, acol, self.mask[arow, acol], detector)
+        if shape is not None:
+            h, w = beam_fit.roi_from_shape(shape, self.config.roi_n_sigma)
+            logger.info(
+                "ROI from i0 beam fit: %d x %d px (sigma_y=%.2f, sigma_x=%.2f)",
+                h, w, shape.sigma_y, shape.sigma_x,
+            )
+            self.config.roi_height, self.config.roi_width = h, w
+            self.beam_shape = shape
+        else:
+            logger.warning(
+                "Beam fit found no usable i0 frames; using configured ROI "
+                "(%d x %d).",
+                self.config.roi_height,
+                self.config.roi_width,
+            )
 
     def _fit_beam_shape(
         self,
@@ -357,3 +515,21 @@ class PXRLoader:
             apply_scale=apply_scale,
             drop_duplicates=drop_duplicates,
         )
+
+    def diagnose_stitches(self) -> pd.DataFrame:
+        """Return a per-boundary stitch diagnostic table for the processed data.
+
+        Shows every detected stitch boundary, what triggered it, the changed
+        conditions, the overlap-point count, and the fitted scale factor — for
+        diagnosing a missing or mis-scaled stitch. See
+        :func:`pxr_reduce.reduction.diagnose_stitches`.
+
+        Returns:
+            One row per stitch boundary (empty if none were detected).
+
+        Raises:
+            RuntimeError: If :meth:`process` has not been run.
+        """
+        if not self.data_processed:
+            raise RuntimeError("Call process() before diagnose_stitches().")
+        return reduction.diagnose_stitches(self.data, self.config)

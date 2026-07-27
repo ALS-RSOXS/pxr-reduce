@@ -39,6 +39,33 @@ def test_invalid_roi_raises():
         ReductionConfig(roi_width=0)
 
 
+def test_to_dict_from_dict_round_trip():
+    cfg = ReductionConfig(
+        detector="cmos_11012", roi_height=33, energy_offset=0.25, darkside="RHS"
+    )
+    restored = ReductionConfig.from_dict(cfg.to_dict())
+    assert restored == cfg
+
+
+def test_to_dict_serializes_detector_spec_as_name():
+    spec = DetectorSpec(name="custom", description="", pixel_size_mm=0.05)
+    cfg = ReductionConfig(detector=spec)
+    data = cfg.to_dict()
+    assert data["detector"] == "custom"
+
+
+def test_from_dict_ignores_unknown_keys():
+    cfg = ReductionConfig.from_dict({"roi_height": 12, "not_a_field": 999})
+    assert cfg.roi_height == 12
+
+
+def test_save_and_load_json_round_trip(tmp_path):
+    cfg = ReductionConfig(detector="cmos_11012", roi_width=27, mask_threshold=120)
+    path = cfg.save_json(tmp_path / "cfg.json")
+    assert path.exists()
+    assert ReductionConfig.load_json(path) == cfg
+
+
 def test_to_header_dict_expands_detector_and_drops_reference():
     cfg = ReductionConfig(detector="default")
     header = cfg.to_header_dict()

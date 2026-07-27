@@ -74,7 +74,7 @@ def dezinger(
 
     Args:
         image: The image (or sub-region) to dezinger, in ADU.
-        config: Reduction configuration (filter size, dezinger toggle).
+        config: Reduction configuration (filter size, toggle, and threshold).
 
     Returns:
         The dezingered image (same shape as input).
@@ -82,7 +82,9 @@ def dezinger(
     if not config.dezinger:
         return image
     filtered = median_filter(image, size=config.filter_size)
-    return dezinger_image(image, med_result=filtered)
+    return dezinger_image(
+        image, med_result=filtered, threshold=config.dezinger_threshold
+    )
 
 
 def clean_image(
@@ -173,6 +175,28 @@ def mask_bounding_box(
     c0 = max(0, int(c[0]) - pad)
     c1 = min(mask.shape[1], int(c[-1]) + pad + 1)
     return slice(r0, r1), slice(c0, c1)
+
+
+def crop_region(
+    image: NDArray[np.floating], center: tuple[int, int], half: int
+) -> tuple[NDArray[np.floating], int, int]:
+    """Return a ``(2*half+1)``-side crop around ``center`` plus its origin.
+
+    Args:
+        image: Source image.
+        center: ``(y, x)`` centre of the crop.
+        half: Half-width of the crop in pixels.
+
+    Returns:
+        ``(crop, y0, x0)`` where ``(y0, x0)`` is the crop's top-left corner in
+        ``image`` coordinates (so ``crop`` coords + origin = image coords).
+    """
+    cy, cx = int(round(center[0])), int(round(center[1]))
+    y0 = max(0, cy - half)
+    y1 = min(image.shape[0], cy + half + 1)
+    x0 = max(0, cx - half)
+    x1 = min(image.shape[1], cx + half + 1)
+    return image[y0:y1, x0:x1], y0, x0
 
 
 def crop_window(
@@ -276,10 +300,36 @@ def integrate_frame(
         A :class:`FrameIntegration` with beam location, counts, and uncertainty.
     """
     beam_spot = locate_beam(image, mask)
+    return integrate_at(image, beam_spot, config, detector, exposure_s)
+
+
+def integrate_at(
+    image: NDArray[np.floating],
+    beam_spot: tuple[int, int],
+    config: ReductionConfig,
+    detector: DetectorSpec,
+    exposure_s: float,
+) -> FrameIntegration:
+    """Integrate the beam/dark ROIs at a *given* beam position (no locating).
+
+    Used by the tracker, which determines the beam position separately.
+
+    Args:
+        image: Cleaned image containing the beam and dark ROIs.
+        beam_spot: ``(y, x)`` beam position in ``image`` coordinates.
+        config: Reduction configuration.
+        detector: Detector supplying the noise model and saturation check.
+        exposure_s: Exposure time in seconds (for the noise model).
+
+    Returns:
+        A :class:`FrameIntegration` at ``beam_spot``.
+    """
     spot = image[roi_slices(beam_spot, config)]
     dark = image[dark_roi_slices(beam_spot, config)]
     counts_spot = float(spot.sum())
     counts_dark = float(dark.sum())
+    # net_counts sums spot and dark independently, so unequal ROI shapes (e.g. a
+    # dark ROI clipped at the frame edge) are fine.
     net = net_counts(spot, dark, detector, exposure_s)
     ratio = counts_spot / counts_dark if counts_dark != 0 else np.inf
     return FrameIntegration(

@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 METADATA_HDU = 0
 IMAGE_HDU = 2
 
+# Memory-mapping FITS data fails with OSError [Errno 22] on many network/SMB
+# shares on Windows, so files are read fully into memory instead.
+_MEMMAP = False
+
 
 def read_fits_header(path: Path | str) -> dict[str, Any]:
     """Read the metadata header of a FITS file into a plain dictionary.
@@ -42,13 +46,18 @@ def read_fits_header(path: Path | str) -> dict[str, Any]:
 
     Raises:
         FileNotFoundError: If the file does not exist.
+        OSError: If the file cannot be read (e.g. corrupt or partially written);
+            the message includes the offending path.
     """
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"{path} is not a valid file.")
-    with fits.open(path) as hdul:
-        header = hdul[METADATA_HDU].header
-        return {key: header[key] for key in header if key != "COMMENT"}
+    try:
+        with fits.open(path, memmap=_MEMMAP) as hdul:
+            header = hdul[METADATA_HDU].header
+            return {key: header[key] for key in header if key != "COMMENT"}
+    except OSError as exc:
+        raise OSError(f"Failed to read FITS header from {path}: {exc}") from exc
 
 
 def read_fits_image(path: Path | str) -> NDArray[np.floating]:
@@ -62,12 +71,16 @@ def read_fits_image(path: Path | str) -> NDArray[np.floating]:
 
     Raises:
         FileNotFoundError: If the file does not exist.
+        OSError: If the file cannot be read; the message includes the path.
     """
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"{path} is not a valid file.")
-    with fits.open(path) as hdul:
-        return np.asarray(hdul[IMAGE_HDU].data, dtype=float)
+    try:
+        with fits.open(path, memmap=_MEMMAP) as hdul:
+            return np.asarray(hdul[IMAGE_HDU].data, dtype=float)
+    except OSError as exc:
+        raise OSError(f"Failed to read FITS image from {path}: {exc}") from exc
 
 
 def read_fits(path: Path | str) -> tuple[dict[str, Any], NDArray[np.floating]]:

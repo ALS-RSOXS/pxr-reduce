@@ -6,6 +6,7 @@ from pxr_reduce.config import ReductionConfig
 from pxr_reduce.reduction import (
     apply_scaling,
     compute_scale_factors,
+    diagnose_stitches,
     finalize,
     mark_stitch_points,
     normalize_scan,
@@ -52,10 +53,24 @@ def test_normalize_scan_sets_r_and_i0_mask():
         counts_refl=[100.0, 100.0, 50.0, 25.0],
     )
     out = normalize_scan(df, ReductionConfig())
-    # sam_z moves at index 2 -> cutoff 3 -> i0 = mean of first 4 (inclusive)
-    i0 = np.mean([100.0, 100.0, 50.0, 25.0])
-    np.testing.assert_allclose(out["R"].to_numpy(), df["counts_refl"] / i0)
-    assert out["i0_mask"].tolist() == [1, 1, 1, 0]
+    # sam_z moves at index 2 -> direct-beam frames are indices 0,1 (before the
+    # move); i0 = mean(100, 100) = 100, so low-angle R normalizes to 1.
+    np.testing.assert_allclose(out["R"].to_numpy(), [1.0, 1.0, 0.5, 0.25])
+    assert out["i0_mask"].tolist() == [1, 1, 0, 0]
+
+
+def test_normalize_scan_excludes_saturated_direct_beam():
+    # First two frames are direct beam; the first is saturated (clipped low) and
+    # must be excluded from i0 so R is not under-normalized.
+    df = _scan_table(
+        sam_th=[0, 0, 1, 2],
+        sam_z=[0, 0, 1, 1],
+        counts_refl=[20.0, 100.0, 50.0, 25.0],  # frame 0 clipped low
+    )
+    df["is_saturated"] = [True, False, False, False]
+    out = normalize_scan(df, ReductionConfig())
+    # i0 uses only the unsaturated direct-beam frame (100), not the clipped 20.
+    np.testing.assert_allclose(out["R"].to_numpy(), [0.2, 1.0, 0.5, 0.25])
 
 
 def test_normalize_scan_no_direct_beam_falls_back():
@@ -102,10 +117,10 @@ def test_reduce_single_segment_end_to_end():
     )
     out = reduce(df, ReductionConfig())
     assert {"sam_th", "q", "R", "R_err"}.issubset(out.columns)
-    # sam_z moves at index 2 -> i0 region is indices 0,1,2 (theta 0,0,1);
-    # reflectivity points are theta 2 and 3.
-    assert len(out) == 2
-    assert out["sam_th"].tolist() == [2, 3]
+    # sam_z moves at index 2 -> direct beam is indices 0,1 (theta 0,0);
+    # reflectivity points are theta 1, 2, 3.
+    assert len(out) == 3
+    assert out["sam_th"].tolist() == [1, 2, 3]
     assert (out["R"] > 0).all()
 
 
@@ -176,6 +191,102 @@ def test_compute_scale_factors_with_repeated_overlap_angle():
     scaled = compute_scale_factors(marked, cfg)  # must not raise
     assert scaled["scale"].iloc[7] == pytest.approx(2.0, rel=1e-6)
     assert scaled["failed_stitch_mask"].iloc[7] == 0
+
+
+def _stitch_scan_with_conditions():
+    """Two-segment scan with i0 frames, a sub-0.2 back-step, and an exposure change.
+
+    i0 (idx 0,1) -> segment 1 at exposure 1.0 (idx 2,3,4) -> stitch back into
+    overlap with exposure 5.0 (idx 5,6,7,8). Post R is 2x pre at the overlap
+    angles, so the expected scale is 2.0. The back-step (0.15 -> 0.05) is smaller
+    than the old 0.2 deg threshold, which would have missed it.
+    """
+    sam_th = [0.0, 0.0, 0.05, 0.10, 0.15, 0.05, 0.10, 0.15, 0.20]
+    sam_z = [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    exposure = [0.5, 0.5, 1.0, 1.0, 1.0, 5.0, 5.0, 5.0, 5.0]
+    # counts_refl / i0(=100) gives R; post = 2x pre at angles 0.10 and 0.15.
+    counts_refl = [100.0, 100.0, 99.0, 50.0, 25.0, 99.0, 100.0, 50.0, 20.0]
+    return pd.DataFrame(
+        {
+            "fits_index": list(range(9)),
+            "scan": [0] * 9,
+            "sam_th": sam_th,
+            "sam_z": sam_z,
+            "exposure": exposure,
+            "q": np.linspace(0.01, 0.05, 9),
+            "energy": [250.0] * 9,
+            "polarization": [100.0] * 9,
+            "counts_refl": counts_refl,
+            "counts_err": [1.0] * 9,
+            "counts_ratio": [2.0] * 9,
+            "is_saturated": [False] * 9,
+        }
+    )
+
+
+def test_mark_detects_condition_change_below_theta_threshold():
+    df = normalize_scan(_stitch_scan_with_conditions(), ReductionConfig())
+    marked = mark_stitch_points(df, ReductionConfig())
+    boundaries = [i for i in range(len(marked)) if marked["mark"].iloc[i] == 1]
+    # Exactly one boundary, at the back-step/exposure change (index 5).
+    assert boundaries == [5]
+    assert "exposure" in marked["stitch_trigger"].iloc[5]
+    assert "backstep" in marked["stitch_trigger"].iloc[5]
+
+
+def test_mark_never_flags_i0_to_first_measurement():
+    # The i0->first-measurement step can go either way from an angle offset and
+    # must never be a boundary. Here it is a *forward* step but with a condition
+    # (exposure) change from i0 to the reflection segment.
+    df = normalize_scan(_stitch_scan_with_conditions(), ReductionConfig())
+    marked = mark_stitch_points(df, ReductionConfig())
+    # i0 frames (0,1) and the first reflection frame (2) are never marked.
+    assert pd.isna(marked["mark"].iloc[0])
+    assert pd.isna(marked["mark"].iloc[1])
+    assert pd.isna(marked["mark"].iloc[2])
+
+
+def test_mark_collapses_settling_repeats_to_one_boundary():
+    # A boundary followed by 3 settling repeats at the backed-up angle, then the
+    # overlap is re-measured forward. Only one boundary should be marked.
+    df = pd.DataFrame(
+        {
+            "fits_index": list(range(9)),
+            "scan": [0] * 9,
+            "sam_th": [1.0, 2.0, 3.0, 2.0, 2.0, 2.0, 2.0, 3.0, 4.0],
+            "i0_mask": [0] * 9,
+            "exposure": [1.0, 1.0, 1.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0],
+        }
+    )
+    marked = mark_stitch_points(df, ReductionConfig())
+    assert [i for i in range(len(marked)) if marked["mark"].iloc[i] == 1] == [3]
+
+
+def test_mark_falls_back_to_backstep_without_condition_columns():
+    # No condition columns present -> pure sam_th back-step detection still works.
+    sam_th = [1, 2, 3, 1, 2, 3, 4]
+    df = pd.DataFrame(
+        {
+            "fits_index": list(range(7)),
+            "scan": [0] * 7,
+            "sam_th": sam_th,
+            "i0_mask": [0] * 7,
+        }
+    )
+    marked = mark_stitch_points(df, ReductionConfig())
+    assert marked["mark"].iloc[3] == 1
+    assert [i for i in range(7) if marked["mark"].iloc[i] == 1] == [3]
+
+
+def test_diagnose_stitches_reports_boundary_details():
+    diag = diagnose_stitches(_stitch_scan_with_conditions(), ReductionConfig())
+    assert len(diag) == 1
+    row = diag.iloc[0]
+    assert row["num_stitch_points"] == 2  # angles 0.10 and 0.15 overlap
+    assert row["scale"] == pytest.approx(2.0, rel=1e-6)
+    assert not row["failed"]
+    assert "exposure" in row["conditions_changed"]
+    assert "5" in row["conditions_changed"]  # exposure 1 -> 5
 
 
 def test_finalize_drops_saturated_and_nonpositive():
