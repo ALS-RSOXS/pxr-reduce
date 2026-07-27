@@ -1,9 +1,16 @@
 # Configuration reference
 
-All reduction parameters live in the `ReductionConfig` dataclass
-([`pxr_reduce.config`](api-reference.md#pxr_reduceconfig)). Construct one and pass
-it to `PXRLoader`; every field is also serialized into the `.dat` export header so
-each result records exactly how it was produced.
+There are two configuration surfaces:
+
+- **`ReductionConfig`** ([`pxr_reduce.config`](api-reference.md#pxr_reduceconfig)) —
+  the reduction *parameters* (detector, ROI, tracking, stitching). Construct one
+  in Python and pass it to `PXRLoader`; every field is serialized into the `.dat`
+  export header so each result records exactly how it was produced.
+- **`RunConfig`** ([`pxr_reduce.run_config`](api-reference.md#pxr_reducerun_config)) —
+  a single editable **TOML** file describing a whole *batch*: where the data lives,
+  which tracker/export options to use, the `ReductionConfig` values, and a map of
+  sample names to scan IDs. This is what `pxr-reduce batch` reads. See
+  [Batch runs (TOML)](#batch-runs-toml) below.
 
 ```python
 from pxr_reduce import ReductionConfig
@@ -24,6 +31,14 @@ positive.
 > the values below (they only override when you pass them). When
 > `roi_from_beam_fit=True`, the ROI is computed from the direct-beam fit and these
 > values are replaced.
+
+> **Beam tracking.** `PXRLoader.process()` uses the **simple** tracker
+> (median-filter + local-argmax, cropped to the search region): direct-beam and
+> segment-start frames are located by the global peak of the full frame, and every
+> other frame within `drift_distance` (or `search_radius`) of the previous
+> position. The older SNR-gated tracker is available as the deprecated
+> `PXRLoader.process_snr()`; the parameters it alone uses are listed under
+> [Deprecated parameters](#deprecated-parameters).
 
 ---
 
@@ -51,12 +66,10 @@ positive.
 | `roi_width` | `int` | `40` | px | Width of the beam ROI. Must be > 0. Replaced when `roi_from_beam_fit=True`. |
 | `trim_x` | `int` | `20` | px | Pixels removed from each **vertical** edge (axis 0) before processing, to drop detector border artifacts. |
 | `trim_y` | `int` | `20` | px | Pixels removed from each **horizontal** edge (axis 1) before processing. |
-| `filter_size` | `int` | `3` | px | Kernel size of the median filter used as the dezinger reference. |
+| `filter_size` | `int` | `5` | px | Kernel size of the median filter used for beam finding and as the dezinger reference. |
 | `dezinger` | `bool` | `True` | — | If True, median-filter and dezinger each frame (removes hot pixels/cosmic rays). If False, skip it for a much faster but noisier reduction. |
-| `mask_threshold` | `int` | `90` | counts | Mean-image counts above which a pixel is treated as a persistent beam location when building the integration mask. |
-| `mask_max_frames` | `int` | `200` | frames | Maximum number of frames read to build the mask; frames are evenly subsampled above this count. `0` uses all frames. |
-| `drift_distance` | `int` | `25` | px | Radius by which mask seed regions are expanded, allowing the beam to drift between frames without leaving the mask. |
-| `dark_pix_offset` | `int` | `20` | px | Gap between the beam ROI and the dark ROI used for background subtraction. |
+| `drift_distance` | `int` | `45` | px | Default beam search radius: how far the beam may move between consecutive frames. The simple tracker searches within this radius of the previous position (overridden per run by `search_radius`). |
+| `dark_pix_offset` | `int` | `50` | px | Gap between the beam ROI and the dark ROI used for background subtraction. |
 | `darkside` | `"LHS" \| "RHS"` | `"LHS"` | — | Preferred side of the beam to place the dark ROI. Falls back to the opposite side when there is not enough room. |
 | `saturate_threshold` | `float` | `2.0` | counts | A frame is flagged saturated if its peak is within this many counts of the detector's full-scale value. |
 
@@ -73,9 +86,84 @@ positive.
 | Parameter | Type | Default | Units | Meaning |
 |---|---|---|---|---|
 | `stitch_cutoff` | `float` | `1.003` | ratio | Minimum spot/dark counts ratio for a point to be eligible as a stitch-overlap point (rejects near-background points). |
-| `stitch_mark_tol` | `float` | `1e-5` | — | Minimum tracked-motor motion that marks a stitch boundary between segments. |
+| `stitch_condition_columns` | `tuple[str, ...]` | `("hos", "exposure", "slits_vert", "slits_horz")` | — | Metadata columns whose change (beyond `stitch_condition_tol`) marks a stitch boundary, alongside a `sam_th` back-step. Missing columns are ignored. |
+| `stitch_condition_tol` | `float` | `0.0` | — | A watched column must change by more than this to count as a condition change. Metadata is pre-rounded, so `0.0` means "any real change". |
+| `stitch_theta_backstep` | `float` | `0.001` | deg | A `sam_th` decrease larger than this between consecutive reflectivity frames marks a stitch boundary. |
 | `new_scan_marker` | `float` | `15.0` | deg | A `sam_th` jump larger than this marks the start of a new scan (used to segment a multi-scan dataset). |
 | `drop_failed_stitch` | `bool` | `True` | — | If True, drop points after a stitch that could not be matched (no safe overlap angle). |
+
+Stitch boundaries are detected between consecutive *reflectivity* frames (i0
+frames are excluded, and the i0→first-measurement step is never a boundary): a
+boundary is marked where `sam_th` steps back into already-measured angles **or**
+any watched condition changes. Use
+[`diagnose_stitches`](api-reference.md#pxr_reducereduction) /
+`PXRLoader.diagnose_stitches()` to see which boundary fired, what triggered it,
+how many overlap points it used, and the fitted scale.
+
+---
+
+## Deprecated parameters
+
+These fields still exist on `ReductionConfig` (and feed the deprecated
+`PXRLoader.process_snr()` SNR-gated tracker) but the standard `process()` does not
+use them, so they are **omitted from the bundled `default_config.toml`**. Add them
+back under `[reduction]` only if you run the base tracker.
+
+| Parameter | Default | Was used for |
+|---|---|---|
+| `mask_threshold` | `80` | SNR tracker's static integration mask. |
+| `mask_max_frames` | `200` | Frames subsampled to build that mask. |
+| `beam_snr_min` | `3.0` | SNR tracker's per-frame detection gate. |
+| `track_smoothing` | `True` | SNR tracker's per-scan trajectory smoothing. |
+| `track_poly_order` | `3` | Polynomial order of that trajectory fit. |
+| `centroid_radius` | `8` | Centroid window around the SNR-tracker peak. |
+| `stitch_mark_tol` | `1e-5` | Legacy stitch marking; replaced by condition-aware detection (fully unused). |
+
+---
+
+## Batch runs (TOML)
+
+`pxr-reduce batch` reads a `RunConfig` from a TOML file (resolved as
+`--config` → `./reduction_config.toml` → built-in defaults). Generate a
+documented starter with `pxr-reduce init-config`. Sections:
+
+**`[paths]`**
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `parent_dir` | path | `"data"` | Folder searched recursively for FITS scans. |
+| `results_root` | path | `"results"` | Where `<sample>.dat` + plots are written. |
+| `fits_glob` | `str` | `"*.fits"` | Glob for FITS files under `parent_dir`. |
+| `scan_number_width` | `int` | `5` | Digit width of the static scan-ID block in filenames (distinguishes it from the frame index). |
+| `scan_number_regex` | `str \| None` | `None` | Optional regex with a `scan` group overriding the width-based rule. |
+
+**`[tracking]`**
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `tracker` | `"simple" \| "base"` | `"simple"` | Beam tracker. `"base"` is the deprecated SNR-gated tracker. |
+| `search_radius` | `int \| None` | `None` | Local search radius (px); `None` uses `reduction.drift_distance`. |
+| `filter_size` | `int \| None` | `None` | Beam-finding median kernel; `None` uses `reduction.filter_size`. |
+
+**`[export]`**
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `angle_decimals` | `int` | `4` | Decimals kept for `sam_th`; also sets the angular step propagated onto q for its significant-figure rounding. |
+| `plots` | `bool` | `True` | Write I-vs-q PNGs alongside each `.dat`. |
+| `apply_scale` | `bool` | `True` | Apply stitch scaling (False = quick reduction). |
+| `drop_duplicates` | `bool` | `True` | Average points sharing (sam_th, energy, polarization). |
+
+**`[reduction]`** — any `ReductionConfig` field from this page.
+
+**`[samples]`** — `name = [scan IDs]`. A sample pools every frame from all listed
+scans into one reduction, written to `results_root/<name>.dat`:
+
+```toml
+[samples]
+B1A1_NEdge_XRR = [89854, 89855]
+B1A1_XRR_P100 = [17344]
+```
 
 ---
 

@@ -155,6 +155,38 @@ def test_simple_loader_reduces_end_to_end(tmp_path, fits_writer, frame_builders)
     assert {"q", "R", "R_err"}.issubset(reduced.columns)
 
 
+def test_cropped_tracking_matches_full_frame(tmp_path, fits_writer, frame_builders):
+    from pxr_reduce.config import ReductionConfig
+
+    beam_image, frame_header = frame_builders
+    # i0 then a specular beam drifting 1 px/frame — well within a small radius.
+    centers = [(28, 28), (28, 28), (28, 30), (28, 31), (28, 32), (28, 33)]
+    sam_z = [0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    sam_th = [0.0, 0.0, 1.0, 2.0, 3.0, 4.0]
+    peaks = [10000.0, 10000.0, 4000.0, 2000.0, 900.0, 400.0]
+
+    files = []
+    for i, (c, z, th, pk) in enumerate(zip(centers, sam_z, sam_th, peaks)):
+        path = tmp_path / f"SIM_{i}.fits"
+        fits_writer(path, beam_image(pk, center=c), frame_header(th, z))
+        files.append(path)
+
+    cfg = dict(trim_x=2, trim_y=2, roi_height=5, roi_width=5, dark_pix_offset=3)
+    cropped = SimplePXRLoader(files, ReductionConfig(**cfg))
+    cropped.process(search_radius=4, progress=False)  # small -> real crop
+    full = SimplePXRLoader(files, ReductionConfig(**cfg))
+    full.process(search_radius=100, progress=False)  # huge -> whole frame
+
+    # Cropping the median filter must not change the beam or the integrated counts.
+    assert list(cropped.data["beam_spot"]) == list(full.data["beam_spot"])
+    np.testing.assert_array_equal(
+        cropped.data["counts_spot"].to_numpy(), full.data["counts_spot"].to_numpy()
+    )
+    np.testing.assert_array_equal(
+        cropped.data["counts_dark"].to_numpy(), full.data["counts_dark"].to_numpy()
+    )
+
+
 def test_simple_loader_median_filters_once_per_frame(
     tmp_path, fits_writer, frame_builders, monkeypatch
 ):

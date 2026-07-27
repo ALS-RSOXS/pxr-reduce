@@ -62,8 +62,8 @@ def run(
         "--config",
         exists=True,
         dir_okay=False,
-        help="Load a ReductionConfig from a JSON file (e.g. from the tuning "
-        "notebook). Config-setting flags below are ignored when this is given; "
+        help="Load reduction parameters from a TOML config file (its [reduction] "
+        "section). Config-setting flags below are ignored when this is given; "
         "--roi-height/--roi-width still override it.",
     ),
     output: Path | None = typer.Option(
@@ -137,7 +137,9 @@ def run(
 
     if config_path is not None:
         typer.echo(f"Loading reduction config from {config_path}")
-        config = ReductionConfig.load_json(config_path)
+        from pxr_reduce.run_config import load_run_config
+
+        config = load_run_config(config_path).reduction
     else:
         config = ReductionConfig(
             detector=detector,
@@ -174,6 +176,106 @@ def run(
     typer.echo(f"{prefix}Wrote: {result['dat']}")
     for plot in result["plots"]:
         typer.echo(f"{prefix}Plot : {plot}")
+
+
+@app.command()
+def batch(
+    config_path: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        exists=True,
+        dir_okay=False,
+        help="TOML config file. Defaults to ./reduction_config.toml, then "
+        "built-in defaults.",
+    ),
+    samples: list[str] = typer.Option(
+        None,
+        "--sample",
+        "-s",
+        help="Reduce only these sample name(s); repeatable. Default: all.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="List what each sample would load and write."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging."),
+) -> None:
+    """Reduce every sample defined in a TOML config into per-sample .dat files."""
+    _configure_logging(verbose)
+
+    from pxr_reduce.run_config import load_run_config, resolve_config_path
+
+    resolved = resolve_config_path(config_path)
+    config = load_run_config(resolved)
+    typer.echo(f"Config: {resolved or 'built-in defaults'}")
+    typer.echo(f"Parent : {config.parent_dir}")
+
+    names = samples or list(config.samples)
+    if not names:
+        raise typer.BadParameter("No samples defined in [samples] (or via --sample).")
+
+    from pxr_reduce.batch import plan_batch, run_batch
+
+    if dry_run:
+        for item in plan_batch(config, names):
+            typer.echo(
+                f"[dry-run] {item['sample']}: scans {item['scans']} -> "
+                f"{item['n_files']} file(s) -> {item['output']}"
+            )
+        return
+
+    typer.echo(f"Reducing {len(names)} sample(s) with the {config.tracker!r} tracker...")
+    results = run_batch(config, names)
+    for name, result in results.items():
+        if "error" in result:
+            typer.echo(f"FAILED {name}: {result['error']}")
+        else:
+            typer.echo(f"Wrote  {name} -> {result['dat']}")
+
+
+@app.command("scan-samples")
+def scan_samples(
+    parent: Path = typer.Argument(
+        ..., exists=True, file_okay=False, help="Parent folder to search recursively."
+    ),
+    pattern: str = typer.Option("*.fits", "--pattern", help="Glob for FITS files."),
+    width: int = typer.Option(5, "--width", help="Scan-ID digit width."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging."),
+) -> None:
+    """Discover scans under PARENT and print a ready-to-paste [samples] map."""
+    _configure_logging(verbose)
+
+    from pxr_reduce.discovery import discover_samples, suggest_sample_map
+
+    scans = discover_samples(parent, glob=pattern, width=width)
+    if not scans:
+        typer.echo(f"No FITS scans found under {parent}.")
+        return
+    typer.echo(f"Found {len(scans)} scan(s):")
+    for scan_id, files in scans.items():
+        typer.echo(f"  {scan_id}: {len(files)} file(s)")
+
+    typer.echo("\nSuggested [samples] (paste into your config, edit names):\n")
+    typer.echo("[samples]")
+    for name, ids in suggest_sample_map(parent, glob=pattern, width=width).items():
+        typer.echo(f"{name} = {ids}")
+
+
+@app.command("init-config")
+def init_config(
+    path: Path = typer.Argument(
+        Path("reduction_config.toml"),
+        help="Destination for the starter config (won't overwrite).",
+    ),
+) -> None:
+    """Write a documented starter TOML config to PATH."""
+    from pxr_reduce.run_config import write_default_config
+
+    try:
+        written = write_default_config(path)
+    except FileExistsError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Wrote {written}. Edit [paths] and [samples], then `pxr-reduce batch`.")
 
 
 if __name__ == "__main__":

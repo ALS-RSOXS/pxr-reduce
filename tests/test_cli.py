@@ -11,6 +11,50 @@ def test_list_detectors():
     assert "default" in result.stdout
 
 
+def test_init_config_writes_starter(tmp_path):
+    dest = tmp_path / "reduction_config.toml"
+    result = runner.invoke(app, ["init-config", str(dest)])
+    assert result.exit_code == 0, result.stdout
+    assert dest.exists()
+    # A second write refuses to overwrite.
+    assert runner.invoke(app, ["init-config", str(dest)]).exit_code != 0
+
+
+def test_scan_samples_prints_map(tmp_path):
+    folder = tmp_path / "beamtime" / "s1"
+    folder.mkdir(parents=True)
+    for frame in range(3):
+        (folder / f"GlassA_90001-{frame:05d}.fits").write_bytes(b"x")
+    result = runner.invoke(app, ["scan-samples", str(tmp_path / "beamtime")])
+    assert result.exit_code == 0, result.stdout
+    assert "[samples]" in result.stdout
+    assert "GlassA = [90001]" in result.stdout
+
+
+def test_batch_dry_run_lists_samples(synthetic_scan_folder, tmp_path):
+    from pxr_reduce.config import ReductionConfig
+    from pxr_reduce.run_config import RunConfig, run_config_to_toml_str
+
+    # Reuse the synthetic scan folder as the parent; name its scan via [samples].
+    folder = synthetic_scan_folder()
+    for frame, old in enumerate(sorted(folder.glob("*.fits"))):
+        old.rename(folder / f"GlassA_90001-{frame:05d}.fits")
+
+    cfg = RunConfig(
+        parent_dir=folder,
+        results_root=tmp_path / "results",
+        reduction=ReductionConfig(roi_height=9, roi_width=9),
+        samples={"GlassA": [90001]},
+    )
+    cfg_path = tmp_path / "reduction_config.toml"
+    cfg_path.write_text(run_config_to_toml_str(cfg))
+
+    result = runner.invoke(app, ["batch", "--config", str(cfg_path), "--dry-run"])
+    assert result.exit_code == 0, result.stdout
+    assert "GlassA" in result.stdout
+    assert not (tmp_path / "results" / "GlassA.dat").exists()
+
+
 def test_run_writes_dat_and_plots_to_results_dir(synthetic_scan_folder, tmp_path):
     folder = synthetic_scan_folder()
     results = tmp_path / "results"
@@ -77,10 +121,14 @@ def test_run_no_matching_files_errors(tmp_path):
 
 def test_run_with_config_file(synthetic_scan_folder, tmp_path):
     from pxr_reduce.config import ReductionConfig
+    from pxr_reduce.run_config import RunConfig, run_config_to_toml_str
 
     folder = synthetic_scan_folder()
-    cfg_path = tmp_path / "tuned.json"
-    ReductionConfig(roi_height=9, roi_width=9, mask_threshold=90).save_json(cfg_path)
+    cfg_path = tmp_path / "tuned.toml"
+    cfg = RunConfig(
+        reduction=ReductionConfig(roi_height=9, roi_width=9, mask_threshold=90)
+    )
+    cfg_path.write_text(run_config_to_toml_str(cfg))
     results = tmp_path / "results"
     result = runner.invoke(
         app,

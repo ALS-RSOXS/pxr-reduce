@@ -1,15 +1,25 @@
 # pxr-reduce — Design & Refactor Plan
 
-**Status:** Draft
+**Status:** Implemented (historical planning document)
 **Author:** Thomas Ferron (tjferron@lbl.gov)
 **Created:** 2026-07-02
 **Scope:** Refactor `PrsoxrLoader` and add viewer, export, combine, CLI, and a
 corrected uncertainty model.
 
-This document captures a review of the current package and a plan for the
-requested features and improvements. It follows ALS Photon Science Computing
-software standards and scientific-computing safety practices. No code has been
-written yet — this is the reference we build against.
+> **This is the original planning document; the refactor has since been built and
+> extended.** For the current package see the
+> [Overview](../index.md), [How-to guide](../how-to.md),
+> [Configuration reference](../configuration.md), and
+> [API reference](../api-reference.md). Notable additions beyond this plan:
+> the **simple median-filter beam tracker** is now the standard `PXRLoader.process`
+> (the SNR-gated tracker is the deprecated `process_snr`); **condition-aware stitch
+> detection** with `diagnose_stitches`; **significant-figure export rounding**; and
+> **TOML-driven batch processing** (`RunConfig`, `discovery`, `batch`, and the
+> `batch`/`scan-samples`/`init-config` CLI commands).
+
+This document captures a review of the original package and the plan for the
+requested features. It follows ALS Photon Science Computing software standards and
+scientific-computing safety practices.
 
 ---
 

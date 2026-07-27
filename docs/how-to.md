@@ -102,6 +102,34 @@ ROI flags override the config default only when supplied; otherwise the
 pxr-reduce list-detectors
 ```
 
+### Batch many samples from a TOML config
+
+`run` reduces one folder; `batch` reduces many **samples** described by a config.
+Each sample lists the scan IDs (the static 5-digit block in the filenames) whose
+frames are pooled into one reduction.
+
+```bash
+# 1. Discover the scans under a parent folder (prints a ready-to-paste map)
+pxr-reduce scan-samples "path/to/beamtime"
+
+# 2. Write a documented starter config and edit [paths]/[samples]
+pxr-reduce init-config            # -> ./reduction_config.toml
+
+# 3. Preview, then run
+pxr-reduce batch --dry-run        # lists each sample, scan IDs, file count, output
+pxr-reduce batch                  # writes results_root/<sample>.dat (+ plots)
+pxr-reduce batch --sample B1A1_NEdge_XRR   # just one sample (repeatable)
+```
+
+`batch` resolves its config as `--config PATH` → `./reduction_config.toml` →
+built-in defaults. The tree under `parent_dir` is searched recursively, so a
+scan's frames may sit in their own sub-folder or be mixed together. A sample that
+fails is logged and skipped, not fatal to the rest of the batch. See the
+[Batch runs (TOML)](configuration.md#batch-runs-toml) section for every config key.
+
+The single-folder `run --config FILE.toml` also accepts a TOML config and uses its
+`[reduction]` section (the JSON config of earlier versions is retired).
+
 ---
 
 ## 2. Python API
@@ -121,18 +149,45 @@ config = ReductionConfig(
 )
 
 loader = PXRLoader(files, config)   # loads metadata; images loaded lazily
-loader.process()                    # build mask, integrate every frame
+loader.process()                    # track beam per scan, integrate every frame
 refl = loader.reduce()              # -> DataFrame of the 1D reflectivity curve
 ```
 
 `reduce()` returns a pandas DataFrame with columns `scan, energy, polarization,
 sam_th, q, R, R_err`.
 
+`process()` uses the standard **simple** tracker (median-filter + local-argmax).
+Tune it per call:
+
+```python
+loader.process(search_radius=45,    # px the beam may drift between frames
+               filter_size=5,       # median-filter kernel for finding
+               progress=True,       # live per-frame bar + timing summary
+               verbose=False)       # per-frame stage timings when profiling
+```
+
+The older SNR-gated tracker is the deprecated `loader.process_snr()` (kept for
+comparison; emits a `DeprecationWarning`).
+
 ### Quick reduction (no scaling)
 
 ```python
 preview = loader.reduce(apply_scale=False)   # i0-normalized only, no stitching
 ```
+
+### Diagnose stitching
+
+If a stitch factor looks wrong (or a segment is missing) with no error, inspect
+every detected boundary:
+
+```python
+loader.diagnose_stitches()   # one row per boundary: trigger, conditions_changed,
+                             # num_stitch_points, scale, scale_err, failed
+```
+
+`num_stitch_points == 0` or `failed == True` pinpoints a stitch that isn't
+working; an empty table means no boundary was detected (check that a watched
+condition changes and that `sam_th` steps back into overlap).
 
 ### Rebuild any image for debugging
 
@@ -163,9 +218,10 @@ from pxr_reduce.viewer import FrameBrowser
 FrameBrowser(loader, energy=250.0, sam_th=(0.0, 5.0)).show()
 ```
 
-The viewer shows the cleaned image (log scale), the integration mask, the beam
-position, the beam and dark ROI boxes, and a side panel of scalar readouts
-(raw counts, reduced intensity, SNR, saturation).
+The viewer shows the cleaned image (log scale), the beam position, the beam and
+dark ROI boxes, the integration mask (when one is present, e.g. after
+`process_snr`), and a side panel of scalar readouts (raw counts, reduced
+intensity, SNR, saturation).
 
 ---
 
@@ -192,6 +248,13 @@ software version + git commit, collection vs. reduction timestamps, the full
 config and detector spec, the fitted ROI/beam sigma (if used), energies and
 polarizations present, and the uncertainty model. It reads back cleanly with
 `pandas.read_csv(path, sep="\t", comment="#")`.
+
+**Significant-figure rounding.** On export, values are rounded to their justified
+precision (the in-memory table keeps full precision, so plots are unaffected):
+`R` and `R_err` to the PDG significant figures of `R_err` (via the `uncertainties`
+package), `q` to the precision implied by propagating the angular step onto it,
+and `sam_th` to `angle_decimals` places. Tune with `save(..., angle_decimals=4)`.
+Line endings are written cleanly (LF), fixing an earlier double-newline artifact.
 
 ### Combine two datasets (e.g. two polarizations)
 

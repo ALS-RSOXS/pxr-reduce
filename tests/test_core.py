@@ -80,7 +80,6 @@ def test_reduce_requires_process(loader):
 def test_end_to_end_reduction(loader):
     loader.process()
     assert loader.data_processed
-    assert loader.mask is not None
     # counts columns populated
     for col in ["counts_spot", "counts_dark", "counts_refl", "counts_err"]:
         assert col in loader.data.columns
@@ -95,6 +94,22 @@ def test_quick_mode_runs(loader):
     loader.process()
     quick = loader.reduce(apply_scale=False)
     assert len(quick) > 0
+
+
+def test_process_snr_deprecated_but_functional(loader):
+    # The old SNR-gated tracker warns but still works and builds its static mask.
+    with pytest.warns(DeprecationWarning):
+        loader.process_snr()
+    assert loader.data_processed
+    assert loader.mask is not None
+    assert (loader.reduce()["R"] > 0).all()
+
+
+def test_simplepxrloader_is_pxrloader_alias():
+    # Back-compat: the deprecated name resolves to PXRLoader (now the standard).
+    from pxr_reduce.simple_track import SimplePXRLoader
+
+    assert SimplePXRLoader is PXRLoader
 
 
 def test_subsample_helper():

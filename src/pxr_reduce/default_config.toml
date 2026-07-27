@@ -1,0 +1,94 @@
+# pxr-reduce configuration template.
+#
+# The CLI resolves a config in this order:
+#   1. the path given to --config
+#   2. ./reduction_config.toml in the current working directory
+#   3. built-in defaults (this file documents them)
+#
+# Copy this to `reduction_config.toml` next to your data (or run
+# `pxr-reduce init-config`), point [paths].parent_dir at your beamtime folder,
+# and fill in [samples]. On Windows use single-quoted TOML literal strings for
+# paths, e.g. 'C:\data\beamtime'.
+
+[paths]
+# Parent folder that contains every scan to be considered. Scans may each sit in
+# their own sub-folder or be mixed together; the tree is searched recursively.
+parent_dir = "path/to/beamtime"
+# Where per-sample outputs are written (one <sample>.dat + <sample>_plots/ each).
+results_root = "results"
+# Glob used to find FITS files under parent_dir.
+fits_glob = "*.fits"
+# Width (digits) of the static scan-ID block in a filename, e.g. 89854. Used by
+# discovery to tell the scan ID apart from the (usually zero-padded) frame index.
+scan_number_width = 5
+# Optional regex overriding scan-ID extraction; must expose a `scan` group, e.g.
+# 'XRR_(?P<scan>\d{5})'. Leave commented to use the width-based default.
+# scan_number_regex = 'XRR_(?P<scan>\d{5})'
+
+[tracking]
+# Beam tracker. "simple" (median-filter + local-argmax) is the standard method.
+# "base" selects the deprecated SNR-gated tracker; its extra parameters
+# (mask_threshold, beam_snr_min, track_smoothing, ...) are not listed here and
+# fall back to their built-in defaults.
+tracker = "simple"
+# Search radius (px) for the local step. Leave commented to use
+# reduction.drift_distance. Small pixels -> a larger radius (e.g. 45) is typical.
+search_radius = 45
+# Median-filter kernel for beam finding. Leave commented to use
+# reduction.filter_size.
+# filter_size = 5
+
+[export]
+# Sample-theta is written to this many decimals; also sets the angular step
+# propagated onto q for its significant-figure rounding.
+angle_decimals = 4
+# Write I-vs-q PNGs alongside each .dat.
+plots = true
+# Apply stitch scaling (false = I0-normalized quick reduction only).
+apply_scale = true
+# Average points sharing (sam_th, energy, polarization).
+drop_duplicates = true
+
+[reduction]
+# --- Detector -----------------------------------------------------------------
+detector = "default"          # registered detector name (see `pxr-reduce list-detectors`)
+
+# --- Metadata / geometry ------------------------------------------------------
+exposure_offset = 0.00389278  # shutter open/close time added to exposure [s]
+energy_resolution = 20.0      # energy rounded to round(E*res)/res eV
+energy_offset = 0.0           # additive energy correction [eV]
+# sam_th_offset = 0.0         # sample-theta offset [deg]; omit for auto-detection
+sam_th_correction = true      # auto-determine sam_th_offset from geometry
+
+# --- Image processing ---------------------------------------------------------
+roi_height = 40               # beam ROI height [px]
+roi_width = 40                # beam ROI width [px]
+trim_x = 20                   # pixels trimmed from each vertical edge
+trim_y = 20                   # pixels trimmed from each horizontal edge
+filter_size = 5               # median-filter kernel for cleanup/beam-finding
+dezinger = true               # median-filter + dezinger each frame
+dezinger_threshold = 10.0     # replace a pixel above this multiple of its local median
+drift_distance = 45           # default beam search radius [px] (tracking.search_radius overrides)
+dark_pix_offset = 50          # dark-ROI offset from the beam ROI [px]
+darkside = "LHS"              # preferred dark-ROI side: "LHS" or "RHS"
+saturate_threshold = 2.0      # ADU from saturation that flags a frame saturated
+
+# --- ROI from direct-beam (i0) shape ------------------------------------------
+roi_from_beam_fit = false     # size the ROI from a moments fit of the i0 frames
+roi_n_sigma = 3.0             # ROI half-extent in beam sigmas when roi_from_beam_fit
+roi_fit_window = 50           # window (px) around the peak for the moments fit
+
+# --- Stitching / scaling ------------------------------------------------------
+stitch_cutoff = 1.003         # min spot/dark ratio for a stitch-eligible point
+new_scan_marker = 15.0        # sam_th jump [deg] marking a new scan
+drop_failed_stitch = true     # drop points that fail to stitch
+# Columns whose change marks a stitch boundary (alongside a sam_th back-step).
+stitch_condition_columns = ["hos", "exposure", "slits_vert", "slits_horz"]
+stitch_condition_tol = 0.0    # a watched column must change by more than this
+stitch_theta_backstep = 0.001 # a sam_th decrease larger than this [deg] marks a boundary
+
+# Map sample names to their scan IDs (the static 5-digit block in the filenames).
+# A sample pools every frame from all listed scans into one reduction, e.g.:
+[samples]
+# B1A1_NEdge_XRR = [89854, 89855]
+# B1A1_XRR_P100 = [17344]

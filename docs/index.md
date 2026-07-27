@@ -13,23 +13,26 @@ throughout.
 ## What it does
 
 ```
-.fits frames ──► load metadata ──► build beam mask ──► integrate each frame
-                                                              │
-        1D R vs q  ◄── stitch & scale ◄── normalize to i0 ◄──┘
+.fits frames ──► load metadata ──► track beam per scan ──► integrate each frame
+                                                                  │
+        1D R vs q  ◄── stitch & scale ◄── normalize to i0 ◄──────┘
                      │
                      └──► export .dat + I-vs-q plots (with provenance header)
 ```
 
 - **Loads** a folder of `.fits` frames, inferring the sample name and frame order
   from the filenames.
-- **Processes** each frame: cleans it, locates the beam within a drift-tolerant
-  mask, and integrates a beam ROI minus a dark ROI into background-subtracted
-  counts with propagated uncertainty.
+- **Processes** each frame: cleans it, tracks the beam per scan (median-filter +
+  local-argmax, seeded on the direct beam), and integrates a beam ROI minus a dark
+  ROI into background-subtracted counts with propagated uncertainty.
 - **Reduces** the per-frame counts into reflectivity `R` vs momentum transfer `q`:
-  normalizes to the direct beam (i0), detects stitch boundaries, and fits scale
-  factors to join the segments.
+  normalizes to the direct beam (i0), detects stitch boundaries (from a `sam_th`
+  back-step or a change in exposure/HOS/slits), and fits scale factors to join the
+  segments.
 - **Exports** the reduced curve as a `.dat` file with an expansive provenance
-  header, plus one I-vs-q PNG per (energy, polarization).
+  header (values rounded to their justified significant figures), plus one I-vs-q
+  PNG per (energy, polarization).
+- **Batches** many samples from a single TOML config, pooling each sample's scans.
 - **Inspects** individual frames with a metadata-driven image viewer.
 
 ## Key design points
@@ -37,7 +40,8 @@ throughout.
 - **Images stay out of the metadata table.** Frames are loaded lazily on demand
   (`ImageStore`), so memory stays flat regardless of dataset size.
 - **Typed configuration.** All reduction parameters live in a single
-  `ReductionConfig` dataclass that also serializes into the export header.
+  `ReductionConfig` dataclass that also serializes into the export header. Batch
+  runs are driven by an editable `RunConfig` TOML file.
 - **Swappable detectors.** Every detector-specific value (pixel size, bit depth,
   gain, noise) lives in a `DetectorSpec` object in a registry.
 - **Data-driven ROI (optional).** The beam ROI can be sized from a 2D-moments fit
@@ -66,6 +70,11 @@ pxr-reduce run "path/to/data"
 
 # Preview first (writes nothing), with verbose logging
 pxr-reduce run "path/to/data" --dry-run -v
+
+# Batch: discover scans, write a config, reduce many samples at once
+pxr-reduce scan-samples "path/to/beamtime"   # prints a [samples] map to paste
+pxr-reduce init-config                        # -> ./reduction_config.toml (edit it)
+pxr-reduce batch                              # -> results/<sample>.dat per sample
 ```
 
 ```python

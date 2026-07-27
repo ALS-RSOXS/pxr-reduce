@@ -11,9 +11,9 @@ as a `.dat` file plus plots. Photon energy, polarization, and instrument metadat
 are tracked throughout.
 
 ```
-.fits frames ──► load metadata ──► build beam mask ──► integrate each frame
-                                                              │
-        1D R vs q  ◄── stitch & scale ◄── normalize to i0 ◄──┘
+.fits frames ──► load metadata ──► track beam per scan ──► integrate each frame
+                                                                  │
+        1D R vs q  ◄── stitch & scale ◄── normalize to i0 ◄──────┘
                      │
                      └──► export .dat + I-vs-q plots (with provenance header)
 ```
@@ -22,17 +22,23 @@ are tracked throughout.
 
 - **Lazy image handling** — frames load on demand, so memory stays flat on large
   datasets; any frame can be rebuilt for debugging.
+- **Simple, robust beam tracking** — per-scan median-filter + local-argmax
+  tracker (seeded on the direct beam, cropped to the search region for speed).
 - **Typed configuration** — all reduction parameters in one `ReductionConfig`,
   serialized into every export header.
+- **Batch processing** — reduce many samples from one editable TOML config,
+  pooling each sample's scans; discovery maps scan IDs to files automatically.
+- **Condition-aware stitching** — boundaries detected from a `sam_th` back-step or
+  a change in exposure/HOS/slits, with `diagnose_stitches()` for inspection.
 - **Swappable detectors** — detector-specific values live in a `DetectorSpec`
   registry; add new detectors without touching reduction code.
 - **Propagated uncertainty** — per-pixel Poisson + read/dark noise carried through
   ROI integration, normalization, and stitch scaling.
 - **Data-driven ROI** (optional) — size the beam ROI from a fit of the direct beam.
-- **Rich export** — `.dat` with an expansive provenance header, per-(energy,
-  polarization) plots, and multi-dataset combining.
+- **Rich export** — `.dat` with an expansive provenance header, significant-figure
+  rounding, per-(energy, polarization) plots, and multi-dataset combining.
 - **Metadata-driven viewer** — query frames and inspect them with beam/ROI overlays.
-- **CLI** — reduce a folder to `.dat` + plots without opening a notebook.
+- **CLI** — reduce a folder or a whole batch to `.dat` + plots without a notebook.
 
 ## Installation
 
@@ -90,6 +96,16 @@ pxr-reduce run "path/to/data" --fit-roi --roi-n-sigma 3
 ```
 
 Run `pxr-reduce run --help` for the full list of options.
+
+**Batch many samples** from one TOML config — each sample pools the frames of its
+listed scan IDs (the static 5-digit block in the filenames):
+
+```bash
+pxr-reduce scan-samples "path/to/beamtime"   # print a [samples] map to paste
+pxr-reduce init-config                        # write ./reduction_config.toml, edit it
+pxr-reduce batch --dry-run                    # preview each sample's files + output
+pxr-reduce batch                              # -> results/<sample>.dat (+ plots)
+```
 
 **Python:**
 

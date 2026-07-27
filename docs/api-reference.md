@@ -29,8 +29,15 @@ and a lazy image store.
 PXRLoader(files: list[str | Path],
           config: ReductionConfig | None = None,
           *, auto_process: bool = False,
-          cache_size: int = 64)
+          cache_size: int = 64,
+          index_by_position: bool = False,
+          name: str | None = None)
 ```
+
+`index_by_position=True` indexes frames by their position in `files` (trusting the
+given order) instead of inferring a shared filename index — used when a sample is
+pooled from several scans whose frame indices reset. `name` overrides the inferred
+sample name.
 
 **Attributes**
 
@@ -38,19 +45,21 @@ PXRLoader(files: list[str | Path],
 |---|---|---|
 | `data` | `DataFrame` | Scalar metadata + per-frame counts (no images). |
 | `config` | `ReductionConfig` | Active configuration. |
-| `mask` | `ndarray[bool] \| None` | Integration mask (set by `process`). |
-| `name` | `str` | Inferred sample name. |
+| `mask` | `ndarray[bool] \| None` | Integration mask; set only by `process_snr` (the standard `process` builds none). |
+| `name` | `str` | Sample name (inferred or supplied). |
 | `path` | `Path` | Source directory. |
 | `beam_shape` | `BeamShape \| None` | Fitted beam shape when `roi_from_beam_fit`. |
 | `sam_th_offset_applied` | `float` | Sample-theta offset applied. |
-| `data_processed` | `bool` | Whether `process()` has run. |
+| `data_processed` | `bool` | Whether processing has run. |
 
 **Methods**
 
 | Method | Description |
 |---|---|
-| `process() -> None` | Build the mask and integrate every frame. |
+| `process(*, search_radius=None, filter_size=None, progress=True, verbose=False) -> None` | Track the beam per scan and integrate every frame (the standard simple tracker; see [`simple_track`](#pxr_reducesimple_track)). |
+| `process_snr() -> None` | **Deprecated** — the older SNR-gated tracker (static mask + anchor + SNR gate + smoothing). Emits `DeprecationWarning`. |
 | `reduce(*, apply_scale=True, drop_duplicates=True) -> DataFrame` | Reduce to the 1D curve. `apply_scale=False` skips stitching (quick mode). |
+| `diagnose_stitches() -> DataFrame` | Per-boundary stitch diagnostics (see [`reduction.diagnose_stitches`](#pxr_reducereduction)). |
 | `query(**conditions) -> DataFrame` | Filter metadata rows; scalar = equality, 2-tuple = inclusive range. |
 | `get_image(fits_index) -> ndarray` | Raw frame (lazy-loaded). |
 | `get_clean_image(fits_index) -> ndarray` | Trimmed + dezingered frame. |
@@ -119,8 +128,8 @@ ReducedDataset(data: DataFrame, provenance: ReductionProvenance)
 | `from_loader(loader, *, reduced=None, apply_scale=True, drop_duplicates=True, reduction_time=None)` | Build from a processed loader (classmethod). |
 | `combine(other) -> ReducedDataset` | Merge with another, preserving both provenances. |
 | `combine_all(datasets) -> ReducedDataset` | Merge a list (staticmethod). |
-| `save(path, *, plots=True, dry_run=False) -> dict` | Write `.dat` + a `<stem>_plots/` folder. |
-| `save_dat(path, *, dry_run=False) -> Path` | Write the tab-delimited `.dat` with header. |
+| `save(path, *, plots=True, angle_decimals=4, dry_run=False) -> dict` | Write `.dat` + a `<stem>_plots/` folder. |
+| `save_dat(path, *, angle_decimals=4, dry_run=False) -> Path` | Write the tab-delimited `.dat` with header; rounds `R`/`R_err` (PDG, via `uncertainties`), `q` (propagated angular step), and `sam_th` (`angle_decimals`). |
 | `save_plots(directory, *, dry_run=False) -> list[Path]` | One I-vs-q PNG per (energy, polarization). |
 | `header_lines() -> list[str]` | The commented header lines. |
 
@@ -134,10 +143,11 @@ Composable reduction stages. Each takes the counts table and a `ReductionConfig`
 |---|---|
 | `reduce(df, config, *, apply_scale=True, drop_duplicates=True) -> DataFrame` | Full pipeline (normalize → stitch → scale → finalize). |
 | `normalize_scan(df, config) -> DataFrame` | Per-scan normalization to i0. |
-| `mark_stitch_points(df, config) -> DataFrame` | Mark stitch boundaries. |
+| `mark_stitch_points(df, config) -> DataFrame` | Mark stitch boundaries: a `sam_th` back-step or a watched-condition change between consecutive reflectivity frames (i0 excluded). Adds `mark`, `stitch_trigger`. |
 | `compute_scale_factors(df, config) -> DataFrame` | Fit and accumulate stitch scale factors. |
 | `apply_scaling(df, config) -> DataFrame` | Divide R by scale, propagate error. |
 | `finalize(df, config, drop_duplicates=True) -> DataFrame` | Mask invalid points, select output. |
+| `diagnose_stitches(df, config) -> DataFrame` | Per-boundary diagnostics (no finalize): `scan, fits_index, sam_th, energy, polarization, trigger, conditions_changed, num_stitch_points, scale, scale_err, failed`. |
 | `stitch_ratio_model(r, scale) -> ndarray` | `curve_fit` model `y = scale·r`. |
 
 ---
@@ -151,13 +161,15 @@ Array-level image processing (fed from the `ImageStore`).
 | `trim(image, trim_x, trim_y) -> ndarray` | Remove edge pixels. |
 | `dezinger(image, config) -> ndarray` | Median-filter/dezinger (or passthrough). |
 | `clean_image(raw, config) -> ndarray` | Trim + dezinger a full frame. |
-| `build_series_mask(images, config) -> ndarray[bool]` | Mask from the mean image + drift dilation. |
+| `build_series_mask(images, config) -> ndarray[bool]` | Mask from the mean image + drift dilation (SNR tracker). |
 | `mask_bounding_box(mask, pad) -> (slice, slice)` | Padded bounding box of the mask. |
+| `crop_region(image, center, half) -> (crop, y0, x0)` | Crop a `2*half+1` box around a center, returning its origin. |
 | `crop_window(image, center, size) -> ndarray` | Centered window (clipped to bounds). |
 | `locate_beam(image, mask) -> (y, x)` | Brightest pixel within the mask. |
 | `roi_slices(beam_spot, config) -> (slice, slice)` | Beam ROI slices. |
 | `dark_roi_slices(beam_spot, config) -> (slice, slice)` | Dark ROI slices. |
-| `integrate_frame(image, mask, config, detector, exposure_s) -> FrameIntegration` | Locate beam and integrate one frame. |
+| `integrate_frame(image, mask, config, detector, exposure_s) -> FrameIntegration` | Locate beam (in mask) and integrate one frame. |
+| `integrate_at(image, beam_spot, config, detector, exposure_s) -> FrameIntegration` | Integrate at a given beam position (no locating). |
 
 ### `class FrameIntegration` (frozen)
 
@@ -267,10 +279,80 @@ ImageStore(paths: Mapping[int, Path | str], cache_size: int = 64)
 
 ---
 
+## `pxr_reduce.simple_track`
+
+The standard beam tracker (median filter + local argmax). Pure functions plus the
+loader driver.
+
+| Function | Description |
+|---|---|
+| `peak(smoothed) -> (y, x)` | Global argmax of an already-filtered image. |
+| `peak_near(smoothed, center, radius) -> (y, x)` | Argmax within `radius` of `center`. |
+| `locate_peak(image, *, filter_size) -> (y, x)` | Median-filter then global peak. |
+| `locate_peak_near(image, center, radius, *, filter_size) -> (y, x)` | Median-filter then peak within `radius`. |
+| `track(frames, *, radius, filter_size, reseed_indices=None) -> list[(y, x)]` | Per-frame trajectory over a sequence (seed + local steps; re-seed at given indices). |
+| `simple_process(loader, *, search_radius=None, filter_size=None, progress=True, verbose=False) -> None` | Drive the tracker over a `PXRLoader` (what `PXRLoader.process` calls). |
+
+`SimplePXRLoader` remains importable as a deprecated alias for `PXRLoader`.
+
+---
+
+## `pxr_reduce.run_config`
+
+TOML run configuration for batch reductions.
+
+### `class RunConfig`
+
+Sections `[paths]`, `[tracking]`, `[export]`, nested `[reduction]`
+(`ReductionConfig`), and `[samples]` (`dict[str, list[int]]`). See the
+[Batch runs (TOML)](configuration.md#batch-runs-toml) reference for every field.
+
+| Function | Description |
+|---|---|
+| `load_run_config(path \| None) -> RunConfig` | Load TOML over defaults (None = defaults). |
+| `run_config_to_toml_str(cfg) -> str` | Serialize to TOML (for headers/round-trips). |
+| `resolve_config_path(explicit) -> Path \| None` | `--config` → `./reduction_config.toml` → None. |
+| `bundled_default_config_text() -> str` | The bundled `default_config.toml` template. |
+| `write_default_config(path) -> Path` | Write the starter template (never overwrites). |
+| `validate_run_config(cfg) -> list[str]` | Human-readable problems (empty if OK). |
+
+---
+
+## `pxr_reduce.discovery`
+
+Find and group FITS scans under a parent folder.
+
+| Function | Description |
+|---|---|
+| `extract_scan_id(filename, *, width=5, regex=None) -> int \| None` | Scan ID from a filename (static width-digit block; frame index is the last block). |
+| `find_scan_files(parent, scan_id, *, glob="*.fits", regex=None) -> list[Path]` | Every frame of a scan (recursive), ordered by frame index. |
+| `discover_samples(parent, *, glob="*.fits", width=5, regex=None) -> dict[int, list[Path]]` | Group all FITS by scan ID. |
+| `suggest_sample_map(parent, *, glob="*.fits", width=5, regex=None) -> dict[str, list[int]]` | Suggested `[samples]` map, grouped by inferred name prefix. |
+
+---
+
+## `pxr_reduce.batch`
+
+Turn a `RunConfig` into per-sample `.dat` files.
+
+| Function | Description |
+|---|---|
+| `sample_files(config, scan_ids) -> list[Path]` | Pooled, ordered frames for a sample's scans. |
+| `plan_batch(config, names=None) -> list[dict]` | Per-sample plan (`sample`, `scans`, `n_files`, `output`) without processing. |
+| `reduce_sample(config, name, *, progress=True, dry_run=False) -> dict` | Reduce one sample and write its `.dat`. |
+| `run_batch(config, names=None, *, progress=True, dry_run=False) -> dict[str, dict]` | Reduce all (or named) samples; failures logged and recorded, not fatal. |
+
+---
+
 ## `pxr_reduce.cli`
 
-Typer application (`app`) with two commands:
+Typer application (`app`). Commands:
 
-- `run FOLDER [options]` — reduce a folder to `.dat` + plots. See
-  [How-to §1](how-to.md#1-command-line) or `pxr-reduce run --help`.
+- `run FOLDER [options]` — reduce a single folder to `.dat` + plots.
+- `batch [--config FILE] [--sample NAME]... [--dry-run]` — reduce every sample in
+  a TOML config.
+- `scan-samples PARENT` — discover scans and print a ready-to-paste `[samples]` map.
+- `init-config [PATH]` — write a documented starter `reduction_config.toml`.
 - `list-detectors` — print registered detector names.
+
+See [How-to §1](how-to.md#1-command-line) or `pxr-reduce <command> --help`.

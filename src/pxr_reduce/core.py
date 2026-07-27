@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import re
+import warnings
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ import pandas as pd
 from numpy.typing import NDArray
 from tqdm.auto import tqdm
 
-from pxr_reduce import beam_fit, image_ops, metadata, reduction, tracking
+from pxr_reduce import beam_fit, image_ops, metadata, reduction, simple_track, tracking
 from pxr_reduce.beam_fit import BeamShape
 from pxr_reduce.config import ReductionConfig
 from pxr_reduce.io.fits_io import ImageStore, read_fits_header
@@ -58,6 +59,10 @@ class PXRLoader:
         config: Reduction configuration; defaults to :class:`ReductionConfig`.
         auto_process: If True, run :meth:`process` immediately.
         cache_size: Max images held in the :class:`ImageStore` LRU cache.
+        index_by_position: Index frames by their position in ``files`` (trusting
+            the given order) instead of inferring a shared numeric index. Use for
+            a sample pooled from several scans whose frame indices reset.
+        name: Sample name; inferred from the filenames when omitted.
 
     Raises:
         ValueError: If ``files`` is empty, contains a non-FITS file, or has no
@@ -72,6 +77,8 @@ class PXRLoader:
         *,
         auto_process: bool = False,
         cache_size: int = 64,
+        index_by_position: bool = False,
+        name: str | None = None,
     ) -> None:
         self.config = config or ReductionConfig()
         self.data_processed = False
@@ -81,14 +88,21 @@ class PXRLoader:
 
         logger.info("Loading %d file(s) — reading headers...", len(files))
         paths = self._validate_files(files)
-        index_regex = self._infer_naming(paths)
-        self.name = self._infer_sample_name(paths[0], index_regex)
+        if index_by_position:
+            # Trust the caller's order and index by position. Used when the files
+            # come from several concatenated scans whose per-scan frame indices
+            # reset (so no single +1 block spans them).
+            self.name = name or self._loose_name(paths[0])
+            index_by_path = {p: i for i, p in enumerate(paths)}
+            self.files = list(paths)
+        else:
+            index_regex = self._infer_naming(paths)
+            self.name = name or self._infer_sample_name(paths[0], index_regex)
+            index_by_path = {
+                p: int(re.search(index_regex, p.name).group("index")) for p in paths
+            }
+            self.files = sorted(paths, key=lambda p: index_by_path[p])
         self.path = paths[0].parent
-
-        index_by_path = {
-            p: int(re.search(index_regex, p.name).group("index")) for p in paths
-        }
-        self.files = sorted(paths, key=lambda p: index_by_path[p])
         self._store = ImageStore(
             {index_by_path[p]: p for p in self.files}, cache_size=cache_size
         )
@@ -129,6 +143,12 @@ class PXRLoader:
     def _infer_sample_name(path: Path, index_regex: str) -> str:
         match = re.search(index_regex, path.name)
         return match.group("re_sample_name") if match else path.stem
+
+    @staticmethod
+    def _loose_name(path: Path) -> str:
+        """Best-effort sample name: the stem minus a trailing run of digit groups."""
+        trimmed = re.sub(r"[ _\-]*\d+(?:[ _\-]\d+)*$", "", path.stem)
+        return trimmed or path.stem
 
     def _load_metadata(self, index_by_path: dict[Path, int]) -> pd.DataFrame:
         records: list[dict[str, Any]] = []
@@ -195,17 +215,101 @@ class PXRLoader:
 
     # -- Processing -----------------------------------------------------------
 
-    def process(self) -> None:
-        """Track the beam per scan and integrate every frame.
+    def process(
+        self,
+        *,
+        search_radius: int | None = None,
+        filter_size: int | None = None,
+        progress: bool = True,
+        verbose: bool = False,
+    ) -> None:
+        """Track the beam per scan and integrate every frame (standard tracker).
+
+        Uses the simple median-filter + local-argmax tracker
+        (:func:`pxr_reduce.simple_track.simple_process`): direct-beam and
+        segment-start frames are located by the global peak of the full frame,
+        and every other frame within ``search_radius`` of the previous position
+        (median-filtering only that region). See :meth:`process_snr` for the older
+        SNR-gated tracker.
+
+        Args:
+            search_radius: Local search radius in pixels; defaults to
+                ``config.drift_distance``.
+            filter_size: Median-filter kernel; defaults to ``config.filter_size``.
+            progress: Show the live per-frame progress bar.
+            verbose: Log per-stage timings for every frame.
+        """
+        if self.config.roi_from_beam_fit:
+            self._fit_roi_from_i0(self.config.detector_spec())
+        simple_track.simple_process(
+            self,
+            search_radius=search_radius,
+            filter_size=filter_size,
+            progress=progress,
+            verbose=verbose,
+        )
+
+    def _fit_roi_from_i0(self, detector: Any) -> None:
+        """Size the ROI from a moments fit of the direct-beam (i0) frames.
+
+        Locates each i0 frame's beam by its global peak (no mask needed), fits the
+        aggregated beam shape, and sets ``roi_height``/``roi_width`` from it. Sets
+        :attr:`beam_shape`; falls back to the configured ROI if no i0 frame is
+        usable (none present, all saturated, or all fits failed).
+        """
+        tx, ty = self.config.trim_x, self.config.trim_y
+        i0 = metadata.direct_beam_mask(self.data)
+        i0_indices = [int(v) for v in self.data.loc[i0, "fits_index"]]
+        shapes: list[BeamShape] = []
+        for i in i0_indices:
+            cleaned = image_ops.dezinger(
+                image_ops.trim(self._store.get(i), tx, ty), self.config
+            )
+            if detector.is_saturated(cleaned, self.config.saturate_threshold):
+                continue
+            y, x = np.unravel_index(int(np.argmax(cleaned)), cleaned.shape)
+            window = image_ops.crop_window(
+                cleaned, (int(y), int(x)), self.config.roi_fit_window
+            )
+            shapes.append(beam_fit.estimate_moments(window))
+        shape = beam_fit.aggregate_shapes(shapes)
+        if shape is None:
+            logger.warning(
+                "Beam fit found no usable i0 frames; using configured ROI "
+                "(%d x %d).",
+                self.config.roi_height, self.config.roi_width,
+            )
+            return
+        h, w = beam_fit.roi_from_shape(shape, self.config.roi_n_sigma)
+        logger.info(
+            "ROI from i0 beam fit: %d x %d px (sigma_y=%.2f, sigma_x=%.2f)",
+            h, w, shape.sigma_y, shape.sigma_x,
+        )
+        self.config.roi_height, self.config.roi_width = h, w
+        self.beam_shape = shape
+
+    def process_snr(self) -> None:
+        """Track the beam with the older SNR-gated centroid tracker (deprecated).
+
+        .. deprecated::
+            :meth:`process` now runs the simple median-filter tracker, which is
+            the standard method. This SNR-gated tracker (static mask + anchor +
+            per-frame SNR gate + trajectory smoothing) is retained for comparison
+            and will be removed in a future release.
 
         A coarse static mask is built from subsampled raw frames (for display and
         to bound the anchor search). Each scan is then tracked in acquisition
         order: an anchor is located on the bright first frame, and each subsequent
         frame's beam is found within ``drift_distance`` of the previous position
         via an SNR-gated centroid. Faint frames become dropouts whose positions
-        are filled from a smoothed trajectory. Only a small region around the
-        beam is dezingered per frame, so memory and time stay bounded.
+        are filled from a smoothed trajectory.
         """
+        warnings.warn(
+            "process_snr() (the SNR-gated tracker) is deprecated; PXRLoader."
+            "process() now uses the simple median-filter tracker.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         detector = self.config.detector_spec()
         tx, ty = self.config.trim_x, self.config.trim_y
         all_indices = [int(i) for i in self.data["fits_index"]]
