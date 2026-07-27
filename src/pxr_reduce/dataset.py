@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
+import tomli_w
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from uncertainties.formatting import PDG_precision
@@ -27,6 +28,7 @@ from pxr_reduce.provenance import (
 )
 
 if TYPE_CHECKING:
+    from pxr_reduce.config import ReductionConfig
     from pxr_reduce.core import PXRLoader
 
 logger = logging.getLogger(__name__)
@@ -121,6 +123,20 @@ def _q_uncertainty(q: float, sam_th_deg: float, angle_decimals: int) -> float:
     return abs(q * math.cos(theta) / sin_theta * step_rad)
 
 
+def _reduction_config_toml(config: ReductionConfig) -> str:
+    """Serialize a `ReductionConfig` as a ``[reduction]`` TOML table.
+
+    Used as the embedded configuration when no full run config (``RunConfig``)
+    TOML is supplied (e.g. the single-folder ``run`` command or the Python API).
+    """
+    reduction = {
+        key: (list(value) if isinstance(value, tuple) else value)
+        for key, value in config.to_dict().items()
+        if value is not None
+    }
+    return tomli_w.dumps({"reduction": reduction})
+
+
 @dataclass
 class ReducedDataset:
     """A reduced reflectivity dataset plus its provenance.
@@ -129,10 +145,14 @@ class ReducedDataset:
         data: Reduced table with columns scan, energy, polarization, sam_th, q,
             R, R_err.
         provenance: Reduction- and source-level provenance for the header.
+        config_toml: The full run configuration as TOML, embedded verbatim in the
+            export header for reproducibility. Defaults to a ``[reduction]`` table
+            built from the loader's config when not supplied.
     """
 
     data: pd.DataFrame
     provenance: ReductionProvenance
+    config_toml: str | None = None
 
     @classmethod
     def from_loader(
@@ -143,6 +163,7 @@ class ReducedDataset:
         apply_scale: bool = True,
         drop_duplicates: bool = True,
         reduction_time: datetime | None = None,
+        config_toml: str | None = None,
     ) -> ReducedDataset:
         """Build a dataset from a processed loader.
 
@@ -153,6 +174,8 @@ class ReducedDataset:
             apply_scale: Passed to ``loader.reduce`` when ``reduced`` is None.
             drop_duplicates: Passed to ``loader.reduce`` when ``reduced`` is None.
             reduction_time: Timestamp to record; defaults to now.
+            config_toml: Full run-config TOML to embed in the header; defaults to a
+                ``[reduction]`` table built from the loader's config.
 
         Returns:
             A :class:`ReducedDataset`.
@@ -161,11 +184,15 @@ class ReducedDataset:
             reduced = loader.reduce(
                 apply_scale=apply_scale, drop_duplicates=drop_duplicates
             )
-        source = build_source_provenance(loader)
+        source = build_source_provenance(loader, reduced)
         provenance = ReductionProvenance.create(
             [source], reduction_time=reduction_time, cwd=loader.path
         )
-        return cls(data=reduced.copy(), provenance=provenance)
+        if config_toml is None:
+            config_toml = _reduction_config_toml(loader.config)
+        return cls(
+            data=reduced.copy(), provenance=provenance, config_toml=config_toml
+        )
 
     def combine(self, other: ReducedDataset) -> ReducedDataset:
         """Combine this dataset with another, preserving both provenances.
@@ -188,7 +215,11 @@ class ReducedDataset:
             sources=merged_sources,
         )
         data = pd.concat([self.data, other.data], ignore_index=True)
-        return ReducedDataset(data=data, provenance=provenance)
+        return ReducedDataset(
+            data=data,
+            provenance=provenance,
+            config_toml=self.config_toml or other.config_toml,
+        )
 
     @staticmethod
     def combine_all(datasets: list[ReducedDataset]) -> ReducedDataset:
@@ -227,6 +258,11 @@ class ReducedDataset:
         ]
         for i, src in enumerate(p.sources, start=1):
             lines += _source_header_lines(i, src)
+        if self.config_toml:
+            lines.append("")
+            lines.append("Configuration (TOML)")
+            lines.append("-" * 40)
+            lines.extend(self.config_toml.rstrip("\n").splitlines())
         lines.append("")
         lines.append("Columns: " + " ".join(_DAT_COLUMNS))
         lines.append(
@@ -372,17 +408,16 @@ class ReducedDataset:
 
 
 def _source_header_lines(index: int, src: SourceProvenance) -> list[str]:
-    """Build the header lines describing one source."""
+    """Build the header lines describing one source.
+
+    The reduction parameters are recorded once in the embedded ``Configuration
+    (TOML)`` block, so this per-source summary omits them.
+    """
     energies = ", ".join(f"{e:g}" for e in src.energies)
     pols = ", ".join(f"{p:g}" for p in src.polarizations)
     detector_name = src.config.get("detector_name", "?")
     noise_measured = src.config.get("detector_noise_measured", False)
     noise_note = "" if noise_measured else "  [PLACEHOLDER noise specs]"
-    config_items = ", ".join(
-        f"{k}={v}"
-        for k, v in src.config.items()
-        if not k.startswith("detector_")
-    )
     return [
         "",
         f"--- Source {index} ---",
@@ -394,7 +429,6 @@ def _source_header_lines(index: int, src: SourceProvenance) -> list[str]:
         f"Polarizations  : {pols}",
         f"sam_th offset  : {src.sam_th_offset} deg",
         f"Detector       : {detector_name}{noise_note}",
-        f"Config         : {config_items}",
     ]
 
 

@@ -72,6 +72,19 @@ def test_reduce_sample_multi_scan_pools_and_writes(beamtime, tmp_path):
     assert result["dat"].exists()
 
 
+def test_batch_dat_embeds_full_run_config(beamtime, tmp_path):
+    out = tmp_path / "results"
+    cfg = _config(beamtime, out, {"GlassA": [90001]})
+    reduce_sample(cfg, "GlassA", progress=False)
+    text = (out / "GlassA.dat").read_text()
+    # The whole run config (not just [reduction]) is embedded for tracking.
+    assert "Configuration (TOML)" in text
+    assert "[paths]" in text
+    assert "[samples]" in text
+    assert "GlassA = [" in text  # tomli_w writes arrays multiline
+    assert "90001," in text
+
+
 def test_reduce_sample_no_files_raises(beamtime, tmp_path):
     cfg = _config(beamtime, tmp_path / "out", {"Missing": [99999]})
     with pytest.raises(FileNotFoundError):

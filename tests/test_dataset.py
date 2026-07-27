@@ -185,6 +185,66 @@ def test_save_dat_rounds_columns(tmp_path):
     assert row["q"] == "0.0074185"  # precision tied to angular step
 
 
+def test_header_embeds_config_toml(dataset):
+    header = "\n".join(dataset.header_lines())
+    # from_loader defaults to a [reduction] TOML table built from the config.
+    assert "Configuration (TOML)" in header
+    assert "[reduction]" in header
+    assert "roi_height" in header
+
+
+def test_explicit_config_toml_embedded_verbatim(processed_loader_factory):
+    loader = processed_loader_factory()
+    toml = "[paths]\nparent_dir = 'C:/data'\n\n[samples]\nS = [12345]\n"
+    ds = ReducedDataset.from_loader(loader, config_toml=toml)
+    header = "\n".join(ds.header_lines())
+    assert "parent_dir = 'C:/data'" in header
+    assert "S = [12345]" in header
+
+
+def test_dat_with_config_toml_still_reads_back(dataset, tmp_path):
+    out = dataset.save_dat(tmp_path / "cfg")
+    text = out.read_text()
+    assert "Configuration (TOML)" in text
+    # The TOML block is commented, so the data still parses cleanly.
+    df = pd.read_csv(out, sep="\t", comment="#")
+    assert {"q", "R", "R_err"}.issubset(df.columns)
+    assert len(df) == len(dataset.data)
+
+
+def test_header_energies_come_from_reduced_data():
+    from pxr_reduce.config import ReductionConfig
+    from pxr_reduce.provenance import build_source_provenance
+
+    # Loader frames include 398.95 eV (e.g. dropped i0/saturated frames); the
+    # reduced output does not. The header must list only the reduced energies.
+    all_frames = pd.DataFrame(
+        {
+            "scan": [0, 0, 0, 0],
+            "energy": [380.0, 398.95, 399.0, 400.0],
+            "polarization": [100.0, 100.0, 100.0, 100.0],
+        }
+    )
+    reduced = pd.DataFrame(
+        {"energy": [380.0, 399.0, 400.0], "polarization": [100.0, 100.0, 100.0]}
+    )
+
+    class _Loader:
+        data = all_frames
+        files: list = []
+        name = "S"
+        path = Path(".")
+        sam_th_offset_applied = 0.0
+        beam_shape = None
+        config = ReductionConfig()
+
+        def __len__(self):
+            return len(self.data)
+
+    src = build_source_provenance(_Loader(), reduced)
+    assert src.energies == [380.0, 399.0, 400.0]  # 398.95 excluded
+
+
 def test_export_rounding_leaves_source_data_untouched(tmp_path):
     data = pd.DataFrame(
         {

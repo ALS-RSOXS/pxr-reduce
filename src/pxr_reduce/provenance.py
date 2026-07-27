@@ -118,16 +118,23 @@ class SourceProvenance:
     collection_time_end: str | None = None
 
 
-def build_source_provenance(loader: PXRLoader) -> SourceProvenance:
+def build_source_provenance(
+    loader: PXRLoader, reduced: Any = None
+) -> SourceProvenance:
     """Capture provenance from a processed loader.
 
     Args:
         loader: A :class:`~pxr_reduce.core.PXRLoader` (processed or not).
+        reduced: The reduced output table. When given, the reported energies and
+            polarizations are taken from it (the values actually present in the
+            data), not from every loaded frame — so dropped-frame energies (i0,
+            saturated, failed-stitch) do not appear in the header.
 
     Returns:
         A populated :class:`SourceProvenance`.
     """
     data = loader.data
+    src = reduced if reduced is not None and len(reduced) else data
     start, end = _collection_time_range(loader.files)
     config = loader.config.to_header_dict()
     # Record the beam shape when the ROI was sized from the direct-beam fit.
@@ -140,8 +147,8 @@ def build_source_provenance(loader: PXRLoader) -> SourceProvenance:
         source_path=str(loader.path),
         n_frames=len(loader),
         n_scans=int(data["scan"].nunique()) if "scan" in data else 0,
-        energies=sorted(float(e) for e in data["energy"].unique()),
-        polarizations=sorted(float(p) for p in data["polarization"].unique()),
+        energies=sorted({round(float(e), 6) for e in src["energy"].unique()}),
+        polarizations=sorted({round(float(p), 6) for p in src["polarization"].unique()}),
         sam_th_offset=float(loader.sam_th_offset_applied),
         config=config,
         collection_time_start=start,

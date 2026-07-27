@@ -15,7 +15,7 @@ from typing import Any
 from pxr_reduce.core import PXRLoader
 from pxr_reduce.dataset import ReducedDataset
 from pxr_reduce.discovery import find_scan_files
-from pxr_reduce.run_config import RunConfig
+from pxr_reduce.run_config import RunConfig, run_config_to_toml_str
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,10 @@ def reduce_sample(
         loader.process_snr()
 
     dataset = ReducedDataset.from_loader(
-        loader, apply_scale=config.apply_scale, drop_duplicates=config.drop_duplicates
+        loader,
+        apply_scale=config.apply_scale,
+        drop_duplicates=config.drop_duplicates,
+        config_toml=run_config_to_toml_str(config),
     )
     return dataset.save(
         config.results_root / f"{name}.dat",
