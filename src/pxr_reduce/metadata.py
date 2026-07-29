@@ -106,14 +106,22 @@ def build_metadata_table(
         raise KeyError(f"Records are missing required header keys: {sorted(missing)}")
 
     df = df[list(HEADER_NAMES)].rename(columns=HEADER_NAMES).round(HEADER_RESOLUTIONS)
-    df["energy"] = _round_energy(df["energy"], config.energy_resolution)
+    df["energy"] = round_energy(df["energy"], config.energy_resolution)
     df = df.sort_values("fits_index", ignore_index=True)
     df.insert(1, "scan", 0)
     return df
 
 
-def _round_energy(energy: pd.Series, resolution: float) -> pd.Series:
-    """Round energy to the nearest ``1/resolution`` eV step."""
+def round_energy(energy: pd.Series, resolution: float) -> pd.Series:
+    """Round energy to the nearest ``1/resolution`` eV step.
+
+    Args:
+        energy: Photon energies in eV.
+        resolution: Steps per eV; energy is rounded to ``round(E*res)/res``.
+
+    Returns:
+        The rounded energies.
+    """
     return np.round(energy * resolution) / resolution
 
 
@@ -189,6 +197,12 @@ def apply_energy_and_theta(
     (using ``config.sam_th_offset`` when given, otherwise auto-determining it if
     ``config.sam_th_correction`` is set), then derives ``wavelength`` and ``q``.
 
+    When a header-file override has supplied ``sam_th_actual``/``energy_actual`` (see
+    :mod:`pxr_reduce.header_file`), ``q`` is computed from those readbacks while the
+    offset is still determined from — and every other correction still keys off — the
+    nominal ``Goal`` columns. The offset is a geometric correction to the encoder zero,
+    so it is applied to both readings.
+
     Args:
         df: Metadata table.
         config: Reduction configuration.
@@ -199,6 +213,8 @@ def apply_energy_and_theta(
     """
     df = df.copy()
     df["energy"] = df["energy"] + config.energy_offset
+    if "energy_actual" in df.columns:
+        df["energy_actual"] = df["energy_actual"] + config.energy_offset
 
     sam_th_offset = 0.0
     if config.sam_th_offset is not None:
@@ -217,10 +233,23 @@ def apply_energy_and_theta(
             )
             sam_th_offset = 0.0
     df["sam_th"] = df["sam_th"] + sam_th_offset
+    if "sam_th_actual" in df.columns:
+        df["sam_th_actual"] = df["sam_th_actual"] + sam_th_offset
 
-    df["wavelength"] = units.energy_to_wavelength(df["energy"].to_numpy())
+    # q reflects where the motors actually were, when that is known.
+    theta_column = "sam_th_actual" if "sam_th_actual" in df.columns else "sam_th"
+    energy_column = "energy_actual" if "energy_actual" in df.columns else "energy"
+    if theta_column != "sam_th" or energy_column != "energy":
+        logger.info(
+            "Computing q from %s and %s (readback), with corrections from the "
+            "nominal columns.",
+            theta_column,
+            energy_column,
+        )
+
+    df["wavelength"] = units.energy_to_wavelength(df[energy_column].to_numpy())
     df["q"] = units.theta_to_q(
-        np.deg2rad(df["sam_th"].to_numpy()), df["wavelength"].to_numpy()
+        np.deg2rad(df[theta_column].to_numpy()), df["wavelength"].to_numpy()
     )
     return df, sam_th_offset
 

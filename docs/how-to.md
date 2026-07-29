@@ -292,14 +292,114 @@ ROI and warns. The fitted sigma and ROI are recorded in the export header.
 
 ---
 
-## 6. Tips and troubleshooting
+## 6. Override faulty FITS metadata from scan header files
+
+Some scans were collected with unreliable per-frame metadata in the FITS headers. The
+beamline also writes a companion text file per scan holding the authoritative motor
+record; point `reduction.header` at the **directory** holding those files to use them
+instead:
+
+```toml
+[reduction]
+# Relative paths resolve against this config file.
+header = "headers"
+```
+
+Omit the key entirely and nothing changes — the FITS metadata is used exactly as it is
+today. From the Python API it is `ReductionConfig(header=Path("headers"))`.
+
+**How frames are matched.** Each row of a header file's `DATA` section ends with the
+FITS file it describes, and that filename is the join key. So one directory can hold a
+header file per scan, no naming convention is required, and loading a subset of a scan
+(`--subsample`) works — unmatched header rows are just counted. If a *loaded* frame has
+no header row the reduction **fails** rather than correcting some frames and leaving
+others on the faulty metadata.
+
+**What gets overridden.** Only motors the file records as a `Goal`/`Actual` pair —
+currently `sam_x`, `sam_y`, `sam_z`, `sam_th`, `det_th`, `energy`, `hos`. Everything
+else keeps its FITS value, including `exposure`, the slit apertures, `beam_current`,
+`i0`, and `polarization`. The set is derived from the file's own columns, so a header
+file that starts recording another motor as a pair is picked up automatically.
+
+**Goal vs Actual.** The nominal `Goal` value becomes the canonical column, so every
+correction that keys off intended positions uses it: scan segmentation, the
+sample-theta offset, stitch-boundary detection, and stitch overlap matching. `q` is
+computed from the `<column>_actual` readback instead. Three columns are kept per
+overridden motor:
+
+| column | meaning |
+|---|---|
+| `sam_th` | `Goal` — drives all corrections, and is the exported angle |
+| `sam_th_actual` | readback — `q` is computed from this |
+| `sam_th_fits` | the original FITS value, kept so the collection bug stays auditable |
+
+The sample-theta offset is determined from `Goal` and then applied to both readings,
+since it corrects the encoder zero. `energy_actual` is deliberately *not* rounded to
+`energy_resolution` — that rounding exists to group nominal energies, and applying it
+to the readback would erase the very information `q` needs.
+
+A useful side effect: `Goal` values repeat *exactly* across the two passes of an
+overlap region, whereas readbacks jitter. Since stitch overlap points are paired by
+exact equality on `sam_th`, driving stitching from `Goal` makes overlap matching
+markedly more reliable.
+
+The export header records that the metadata did not come from the FITS files, which
+header files contributed, and how many frames were overridden.
+
+---
+
+## 7. Tips and troubleshooting
 
 - **Run `--dry-run -v` first.** Confirm the sample name, frame count, beam-region
   size, and reduced point count look right before writing.
 - **Check the ROI visually.** Open a frame in the viewer to confirm the beam/dark
   boxes land on the beam and background.
-- **"only has one stitch point" warning** is informational — it flags scans where
-  the scale factor rests on a single overlap angle.
+- **`SUSPECT` stitches** are reported by the CLI and in the `.dat` header's *Stitch
+  quality* block. The scale was still applied — the flag means it may be wrong, for
+  one of two reasons: the overlap points disagree with each other about the scale
+  (more than `stitch_max_overlap_rms`), or the fitted scale is far from the value the
+  condition change predicts (more than `stitch_max_scale_deviation`). Because
+  reflectivity is already normalized by exposure and beam current, a boundary that
+  only changes exposure — or a bare angle back-step — must fit ~1.0, so a deviation
+  there is a real red flag. A stitch resting on a single overlap angle is always
+  suspect: its scale cannot be cross-checked.
+- **`FAILED` stitches** could not be fitted at all (usually no overlapping angles).
+  The boundary is reported with its reason, later boundaries are still evaluated, and
+  every point from the failure to the end of that scan is flagged as having an
+  unestablished absolute scale — dropped when `drop_failed_stitch` is set.
+- **Use `loader.diagnose_stitches()`** for the full per-boundary table (trigger,
+  changed conditions, overlap count, scale, `overlap_rms_rel`, `expected_scale`,
+  `suspect`, `quality_note`), and `loader.overlap_report()` for every individual
+  candidate frame with the reason it was or wasn't used.
+- **`--diagnostics` writes a `stitch/` folder** with a subfolder per scan:
+
+  ```text
+  <sample>_diagnostics/stitch/
+      stitch_summary.md               every boundary, every dropped point
+      dropped_points.md               the same, one table for the whole sample
+      scan_00/
+          boundary_01.png             the stitch itself
+          saturated/frame_00041_roi.png   ROI of a saturation-dropped frame
+  ```
+
+  The per-boundary figure has two panels. The top is R vs angle: each overlap
+  candidate is marked by fate (used, saturated, below the spot/dark cutoff,
+  direct-beam, partner dropped), and the post-change segment is drawn both raw and
+  divided by the fitted scale, so you can see whether the two segments overlay. The
+  bottom is the fit itself — post-change R against pre-change R, one point per
+  matched angle, with the fitted through-origin line and (where predictable) the
+  expected line. A point off the line is an angle where the segments disagree; one
+  or two points means nothing constrains the fit.
+
+  `stitch_summary.md` embeds each figure and names the source `.fits` file for every
+  dropped point, plus the ROI image where one was written. Saturated frames that were
+  never overlap candidates are listed there too, without images.
+- **Saturation is judged on the integrated beam ROI only** — saturation elsewhere on
+  the detector does not affect the measured counts and is not flagged. The per-frame
+  pixel counts are in the `n_sat_roi` and `n_sat_dark` columns; a non-zero
+  `n_sat_dark` means the background estimate is clipped and `counts_ratio` is
+  unreliable. Note the check runs *after* dezingering, so an isolated hot pixel is
+  replaced before it can flag a frame; what remains is genuine beam clipping.
 - **Slow on a network drive?** Reading full frames over a network is I/O-bound;
   copy the data locally, or ask about lazy section reads.
 - **`R_err` looks non-physical.** Detector noise parameters are placeholders until

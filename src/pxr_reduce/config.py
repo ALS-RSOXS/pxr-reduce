@@ -23,6 +23,15 @@ DarkSide = Literal["LHS", "RHS"]
 BeamLocator = Literal["peak", "centroid"]
 
 
+def _serializable(data: dict[str, Any]) -> dict[str, Any]:
+    """Convert values that JSON and TOML writers cannot represent.
+
+    ``Path`` fields have to become strings before the config is embedded in an export
+    header or written with :func:`json.dumps`, both of which reject them.
+    """
+    return {k: (str(v) if isinstance(v, Path) else v) for k, v in data.items()}
+
+
 @dataclass
 class ReductionConfig:
     """Parameters controlling a PXR reduction run.
@@ -33,6 +42,10 @@ class ReductionConfig:
 
     Args:
         detector: Registered detector name or a ``DetectorSpec`` instance.
+        header: Directory of beamline scan header files whose ``DATA`` section
+            overrides the per-frame FITS metadata (see
+            :mod:`pxr_reduce.header_file`). ``None`` — the default — leaves the FITS
+            metadata untouched and the reduction unchanged.
         exposure_offset: Shutter open/close time added to exposure, in seconds.
         energy_resolution: Energy is rounded to ``round(E*res)/res`` eV.
         energy_offset: Additive energy correction in eV.
@@ -80,6 +93,17 @@ class ReductionConfig:
             "any real change").
         stitch_theta_backstep: A ``sam_th`` decrease larger than this (deg)
             between consecutive reflectivity frames marks a stitch boundary.
+        stitch_normalized_conditions: Watched columns whose effect is already
+            divided out of ``counts_refl``. A boundary triggered only by these (or
+            by a bare back-step) must therefore fit a scale of ~1.0, which makes it
+            checkable — see ``stitch_max_scale_deviation``. ``exposure`` qualifies
+            because reflectivity is normalized by exposure x beam current.
+        stitch_max_overlap_rms: Flag a stitch as suspect when its overlap points
+            disagree about the fitted scale by more than this relative RMS
+            (0.20 = 20%). Diagnostic only; nothing is dropped.
+        stitch_max_scale_deviation: Flag a stitch as suspect when its fitted scale
+            differs fractionally from the expected scale by more than this
+            (0.10 = 10%), for boundaries where the expected scale is known.
         roi_from_beam_fit: If True, size the ROI from a moments fit of the direct
             beam (i0) frames instead of using ``roi_height``/``roi_width``.
         roi_n_sigma: ROI half-extent in beam sigmas when ``roi_from_beam_fit``.
@@ -88,6 +112,9 @@ class ReductionConfig:
 
     # --- Detector selection ---------------------------------------------------
     detector: str | DetectorSpec = "default"
+
+    # --- Metadata source ------------------------------------------------------
+    header: Path | None = None
 
     # --- Metadata / geometry --------------------------------------------------
     exposure_offset: float = 0.00389278
@@ -138,10 +165,22 @@ class ReductionConfig:
     stitch_condition_tol: float = 0.0
     stitch_theta_backstep: float = 0.001
 
+    # --- Stitch-quality checks (diagnostic; never drop data) ------------------
+    stitch_normalized_conditions: tuple[str, ...] = ("exposure",)
+    stitch_max_overlap_rms: float = 0.20
+    stitch_max_scale_deviation: float = 0.10
+
     def __post_init__(self) -> None:
         # Normalize to a tuple so a JSON round-trip (which yields a list) still
         # compares equal to the in-memory config.
         self.stitch_condition_columns = tuple(self.stitch_condition_columns)
+        self.stitch_normalized_conditions = tuple(self.stitch_normalized_conditions)
+        if self.header is not None:
+            self.header = Path(self.header)
+        if self.stitch_max_overlap_rms <= 0:
+            raise ValueError("stitch_max_overlap_rms must be positive.")
+        if self.stitch_max_scale_deviation <= 0:
+            raise ValueError("stitch_max_scale_deviation must be positive.")
         if self.darkside not in ("LHS", "RHS"):
             raise ValueError(f"darkside must be 'LHS' or 'RHS', got {self.darkside!r}")
         if self.energy_resolution <= 0:
@@ -166,7 +205,7 @@ class ReductionConfig:
         The detector reference is expanded into its full specification so export
         headers capture every value used in the reduction.
         """
-        data = asdict(self)
+        data = _serializable(asdict(self))
         # Replace the detector reference with its expanded specification.
         data.pop("detector", None)
         data.update(self.detector_spec().to_header_dict())
@@ -178,7 +217,7 @@ class ReductionConfig:
         Unlike :meth:`to_header_dict`, this preserves the ``detector`` field so
         the config can be reconstructed with :meth:`from_dict`.
         """
-        data = asdict(self)
+        data = _serializable(asdict(self))
         detector = self.detector
         data["detector"] = detector if isinstance(detector, str) else detector.name
         return data

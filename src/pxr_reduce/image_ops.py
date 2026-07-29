@@ -8,6 +8,11 @@ at a time and keep only scalar results.
 Beam/ROI coordinates are expressed in the trimmed image frame produced by
 :func:`clean_image`; keep that consistent across masking, beam-finding, and
 integration.
+
+Saturation is always judged on the integrated beam ROI (see :func:`integrate_at`),
+never on a whole frame or on the tracker's search region — only saturation inside
+the ROI corrupts the measured counts, and the ROI is the one region whose extent
+does not depend on which processing branch handled the frame.
 """
 
 from __future__ import annotations
@@ -38,7 +43,12 @@ class FrameIntegration:
         counts_dark: Summed counts in the dark ROI (ADU).
         net: Background-subtracted counts and uncertainty (ADU).
         counts_ratio: ``counts_spot / counts_dark`` (used for stitch eligibility).
-        is_saturated: Whether the frame approached detector saturation.
+        is_saturated: Whether the *integrated beam ROI* contains a saturated pixel.
+        n_sat_roi: Saturated pixel count in the beam ROI (what sets
+            ``is_saturated``).
+        n_sat_dark: Saturated pixel count in the dark ROI. Reported for diagnostics
+            only — it never sets ``is_saturated``, but a non-zero value means the
+            background estimate is clipped and ``counts_ratio`` is unreliable.
     """
 
     beam_spot: tuple[int, int]
@@ -47,6 +57,8 @@ class FrameIntegration:
     net: Value
     counts_ratio: float
     is_saturated: bool
+    n_sat_roi: int = 0
+    n_sat_dark: int = 0
 
 
 def trim(image: NDArray[np.floating], trim_x: int, trim_y: int) -> NDArray[np.floating]:
@@ -314,6 +326,12 @@ def integrate_at(
 
     Used by the tracker, which determines the beam position separately.
 
+    Saturation is judged on the beam ROI alone, not on ``image``. ``image`` is a
+    whole trimmed frame for some frames and a crop around the previous beam for
+    others, so testing it would make the flag depend on which code path ran; the ROI
+    is the same physical pixels either way, and it is the only region whose
+    saturation actually corrupts ``counts_spot``.
+
     Args:
         image: Cleaned image containing the beam and dark ROIs.
         beam_spot: ``(y, x)`` beam position in ``image`` coordinates.
@@ -326,17 +344,32 @@ def integrate_at(
     """
     spot = image[roi_slices(beam_spot, config)]
     dark = image[dark_roi_slices(beam_spot, config)]
+    if spot.size < config.roi_height * config.roi_width:
+        # roi_slices does not clamp to the image bounds, so a beam within half a ROI
+        # of an edge yields a clipped (possibly empty) slice and counts_spot is not
+        # the configured integration. Worth knowing about: it means the beam was
+        # tracked to the edge of the usable frame.
+        logger.warning(
+            "Beam ROI at %s is clipped by the frame edge (%d of %d px); counts_spot "
+            "is integrated over less than the configured ROI.",
+            beam_spot,
+            spot.size,
+            config.roi_height * config.roi_width,
+        )
     counts_spot = float(spot.sum())
     counts_dark = float(dark.sum())
     # net_counts sums spot and dark independently, so unequal ROI shapes (e.g. a
     # dark ROI clipped at the frame edge) are fine.
     net = net_counts(spot, dark, detector, exposure_s)
     ratio = counts_spot / counts_dark if counts_dark != 0 else np.inf
+    threshold = config.saturate_threshold
     return FrameIntegration(
         beam_spot=beam_spot,
         counts_spot=counts_spot,
         counts_dark=counts_dark,
         net=net,
         counts_ratio=ratio,
-        is_saturated=detector.is_saturated(image, config.saturate_threshold),
+        is_saturated=detector.is_saturated(spot, threshold),
+        n_sat_roi=detector.count_saturated(spot, threshold),
+        n_sat_dark=detector.count_saturated(dark, threshold),
     )

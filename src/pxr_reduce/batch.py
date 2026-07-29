@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from pxr_reduce import diagnostics, reduction
 from pxr_reduce.core import PXRLoader
 from pxr_reduce.dataset import ReducedDataset
 from pxr_reduce.discovery import find_scan_files
@@ -73,7 +74,12 @@ def plan_batch(
 
 
 def reduce_sample(
-    config: RunConfig, name: str, *, progress: bool = True, dry_run: bool = False
+    config: RunConfig,
+    name: str,
+    *,
+    progress: bool = True,
+    diagnostics_plots: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Reduce one sample and write its ``.dat`` (and plots).
 
@@ -81,10 +87,15 @@ def reduce_sample(
         config: The run configuration.
         name: Sample name (must be a key in ``config.samples``).
         progress: Show the tracker's progress bar (simple tracker only).
+        diagnostics_plots: Also write diagnostic plots to
+            ``results_root/<name>_diagnostics/``.
         dry_run: If True, do everything except write files.
 
     Returns:
-        The mapping returned by :meth:`ReducedDataset.save` (``dat``/``plots``).
+        The mapping returned by :meth:`ReducedDataset.save` (``dat``/``plots``),
+        plus a ``stitches`` key holding the per-outcome boundary counts (see
+        :func:`~pxr_reduce.reduction.summarize_stitches`) and a ``diagnostics`` key
+        when ``diagnostics_plots`` is set.
 
     Raises:
         KeyError: If ``name`` is not in the config's samples.
@@ -116,12 +127,18 @@ def reduce_sample(
         drop_duplicates=config.drop_duplicates,
         config_toml=run_config_to_toml_str(config),
     )
-    return dataset.save(
+    result = dataset.save(
         config.results_root / f"{name}.dat",
         plots=config.plots,
         angle_decimals=config.angle_decimals,
         dry_run=dry_run,
     )
+    result["stitches"] = reduction.summarize_stitches(dataset.stitch_report)
+    if diagnostics_plots:
+        result["diagnostics"] = diagnostics.save_diagnostics(
+            loader, config.results_root / f"{name}_diagnostics", dry_run=dry_run
+        )
+    return result
 
 
 def run_batch(
@@ -129,6 +146,7 @@ def run_batch(
     names: list[str] | None = None,
     *,
     progress: bool = True,
+    diagnostics_plots: bool = False,
     dry_run: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Reduce every sample in the config (or a named subset).
@@ -140,6 +158,7 @@ def run_batch(
         config: The run configuration.
         names: Sample names to reduce; None uses every sample in the config.
         progress: Show the tracker's progress bar (simple tracker only).
+        diagnostics_plots: Also write diagnostic plots for each sample.
         dry_run: If True, process but write nothing.
 
     Returns:
@@ -154,7 +173,11 @@ def run_batch(
             continue
         try:
             results[name] = reduce_sample(
-                config, name, progress=progress, dry_run=dry_run
+                config,
+                name,
+                progress=progress,
+                diagnostics_plots=diagnostics_plots,
+                dry_run=dry_run,
             )
         except Exception as exc:
             logger.error("Sample %r failed: %s", name, exc)

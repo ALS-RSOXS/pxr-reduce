@@ -104,6 +104,8 @@ class SourceProvenance:
         config: Flattened reduction config + detector specification.
         collection_time_start: Earliest collection timestamp (ISO), if known.
         collection_time_end: Latest collection timestamp (ISO), if known.
+        header_override: Summary of the header-file metadata override, or None when
+            the FITS metadata was used as collected.
     """
 
     sample_name: str
@@ -116,6 +118,7 @@ class SourceProvenance:
     config: dict[str, Any]
     collection_time_start: str | None = None
     collection_time_end: str | None = None
+    header_override: str | None = None
 
 
 def build_source_provenance(
@@ -153,6 +156,11 @@ def build_source_provenance(
         config=config,
         collection_time_start=start,
         collection_time_end=end,
+        header_override=(
+            override.describe()
+            if (override := getattr(loader, "header_override", None)) is not None
+            else None
+        ),
     )
 
 

@@ -72,6 +72,26 @@ def test_reduce_sample_multi_scan_pools_and_writes(beamtime, tmp_path):
     assert result["dat"].exists()
 
 
+def test_reduce_sample_reports_stitch_counts(beamtime, tmp_path):
+    out = tmp_path / "results"
+    cfg = _config(beamtime, out, {"GlassA": [90001]})
+    result = reduce_sample(cfg, "GlassA", progress=False)
+    stitches = result["stitches"]
+    assert set(stitches) == {"total", "ok", "suspect", "failed"}
+    assert stitches["ok"] + stitches["suspect"] + stitches["failed"] == (
+        stitches["total"]
+    )
+
+
+def test_reduce_sample_with_diagnostics(beamtime, tmp_path):
+    out = tmp_path / "results"
+    cfg = _config(beamtime, out, {"GlassA": [90001]})
+    result = reduce_sample(cfg, "GlassA", progress=False, diagnostics_plots=True)
+    assert "diagnostics" in result
+    assert (out / "GlassA_diagnostics" / "beam_track.png").exists()
+    assert list((out / "GlassA_diagnostics").glob("counts_vs_theta_*.png"))
+
+
 def test_batch_dat_embeds_full_run_config(beamtime, tmp_path):
     out = tmp_path / "results"
     cfg = _config(beamtime, out, {"GlassA": [90001]})

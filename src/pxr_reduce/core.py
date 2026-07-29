@@ -26,7 +26,15 @@ import pandas as pd
 from numpy.typing import NDArray
 from tqdm.auto import tqdm
 
-from pxr_reduce import beam_fit, image_ops, metadata, reduction, simple_track, tracking
+from pxr_reduce import (
+    beam_fit,
+    header_file,
+    image_ops,
+    metadata,
+    reduction,
+    simple_track,
+    tracking,
+)
 from pxr_reduce.beam_fit import BeamShape
 from pxr_reduce.config import ReductionConfig
 from pxr_reduce.io.fits_io import ImageStore, read_fits_header
@@ -85,6 +93,7 @@ class PXRLoader:
         self.mask: NDArray[np.bool_] | None = None
         self.sam_th_offset_applied: float = 0.0
         self.beam_shape: BeamShape | None = None
+        self.header_override: header_file.OverrideReport | None = None
 
         logger.info("Loading %d file(s) — reading headers...", len(files))
         paths = self._validate_files(files)
@@ -157,6 +166,13 @@ class PXRLoader:
             record["fits_index"] = index_by_path[p]
             records.append(record)
         table = metadata.build_metadata_table(records, self.config)
+        # The FITS metadata is stored first, then overridden, so every downstream
+        # correction (scan labelling, theta offset, q) sees the corrected values.
+        if self.config.header is not None:
+            filenames = {index_by_path[p]: p.name for p in self.files}
+            table, self.header_override = header_file.apply_override(
+                table, filenames, self.config
+            )
         table, self.sam_th_offset_applied = metadata.prepare_metadata(
             table, self.config
         )
@@ -265,12 +281,15 @@ class PXRLoader:
             cleaned = image_ops.dezinger(
                 image_ops.trim(self._store.get(i), tx, ty), self.config
             )
-            if detector.is_saturated(cleaned, self.config.saturate_threshold):
-                continue
             y, x = np.unravel_index(int(np.argmax(cleaned)), cleaned.shape)
             window = image_ops.crop_window(
                 cleaned, (int(y), int(x)), self.config.roi_fit_window
             )
+            # Judge saturation on the fitted window, not the whole frame: a clipped
+            # beam core invalidates the moments fit, a hot pixel elsewhere does not.
+            if detector.is_saturated(window, self.config.saturate_threshold):
+                logger.debug("Skipping i0 frame %d in beam fit: ROI saturated", i)
+                continue
             shapes.append(beam_fit.estimate_moments(window))
         shape = beam_fit.aggregate_shapes(shapes)
         if shape is None:
@@ -566,11 +585,12 @@ class PXRLoader:
         for i in i0_indices:
             sub = image_ops.trim(self._store.get(i), tx, ty)[row_sl, col_sl]
             cleaned = image_ops.dezinger(sub, self.config)
-            if detector.is_saturated(cleaned, self.config.saturate_threshold):
-                logger.debug("Skipping saturated i0 frame %d in beam fit", i)
-                continue
             beam = image_ops.locate_beam(cleaned, sub_mask)
             window = image_ops.crop_window(cleaned, beam, self.config.roi_fit_window)
+            # Judge saturation on the fitted window (see _fit_roi_from_i0).
+            if detector.is_saturated(window, self.config.saturate_threshold):
+                logger.debug("Skipping saturated i0 frame %d in beam fit", i)
+                continue
             shapes.append(beam_fit.estimate_moments(window))
         return beam_fit.aggregate_shapes(shapes)
 
@@ -585,6 +605,8 @@ class PXRLoader:
         self.data["counts_dark"] = [r.counts_dark for r in results]
         self.data["counts_ratio"] = [r.counts_ratio for r in results]
         self.data["is_saturated"] = [r.is_saturated for r in results]
+        self.data["n_sat_roi"] = [r.n_sat_roi for r in results]
+        self.data["n_sat_dark"] = [r.n_sat_dark for r in results]
         net_value = np.array([r.net.value for r in results])
         net_sigma = np.array([r.net.sigma for r in results])
         self.data["counts_refl"] = net_value / norm
@@ -637,3 +659,19 @@ class PXRLoader:
         if not self.data_processed:
             raise RuntimeError("Call process() before diagnose_stitches().")
         return reduction.diagnose_stitches(self.data, self.config)
+
+    def overlap_report(self) -> pd.DataFrame:
+        """Return every stitch-overlap candidate point and whether it was used.
+
+        Answers "why was that point not used in the stitch?" for each boundary. See
+        :func:`pxr_reduce.reduction.overlap_report`.
+
+        Returns:
+            One row per candidate frame per boundary (empty if no boundaries).
+
+        Raises:
+            RuntimeError: If :meth:`process` has not been run.
+        """
+        if not self.data_processed:
+            raise RuntimeError("Call process() before overlap_report().")
+        return reduction.overlap_report(self.data, self.config)

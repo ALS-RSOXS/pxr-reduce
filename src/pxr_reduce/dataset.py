@@ -26,6 +26,7 @@ from pxr_reduce.provenance import (
     SourceProvenance,
     build_source_provenance,
 )
+from pxr_reduce.reduction import summarize_stitches
 
 if TYPE_CHECKING:
     from pxr_reduce.config import ReductionConfig
@@ -48,6 +49,9 @@ _COLUMN_UNITS = {
 # Decimal places to which sample-theta is trusted; also sets the assumed angular
 # step (10^-N deg) used to propagate an uncertainty onto q for export rounding.
 _ANGLE_DECIMALS = 4
+
+# Cap on flagged stitch boundaries listed individually in the export header.
+_MAX_STITCH_HEADER_LINES = 20
 
 
 def _error_decimals(error: float) -> int | None:
@@ -148,11 +152,15 @@ class ReducedDataset:
         config_toml: The full run configuration as TOML, embedded verbatim in the
             export header for reproducibility. Defaults to a ``[reduction]`` table
             built from the loader's config when not supplied.
+        stitch_report: Per-boundary stitch diagnostics (from
+            :func:`~pxr_reduce.reduction.diagnose_stitches`), summarized in the
+            export header. None means no stitch scaling was applied.
     """
 
     data: pd.DataFrame
     provenance: ReductionProvenance
     config_toml: str | None = None
+    stitch_report: pd.DataFrame | None = None
 
     @classmethod
     def from_loader(
@@ -190,8 +198,17 @@ class ReducedDataset:
         )
         if config_toml is None:
             config_toml = _reduction_config_toml(loader.config)
+        # Only meaningful when scaling ran; a quick reduction has no stitches.
+        stitch_report = None
+        if apply_scale:
+            stitch_report = loader.diagnose_stitches()
+            if len(stitch_report):
+                stitch_report["sample"] = loader.name
         return cls(
-            data=reduced.copy(), provenance=provenance, config_toml=config_toml
+            data=reduced.copy(),
+            provenance=provenance,
+            config_toml=config_toml,
+            stitch_report=stitch_report,
         )
 
     def combine(self, other: ReducedDataset) -> ReducedDataset:
@@ -215,10 +232,18 @@ class ReducedDataset:
             sources=merged_sources,
         )
         data = pd.concat([self.data, other.data], ignore_index=True)
+        reports = [
+            r
+            for r in (self.stitch_report, other.stitch_report)
+            if r is not None and len(r)
+        ]
         return ReducedDataset(
             data=data,
             provenance=provenance,
             config_toml=self.config_toml or other.config_toml,
+            stitch_report=(
+                pd.concat(reports, ignore_index=True) if reports else None
+            ),
         )
 
     @staticmethod
@@ -258,6 +283,7 @@ class ReducedDataset:
         ]
         for i, src in enumerate(p.sources, start=1):
             lines += _source_header_lines(i, src)
+        lines += _stitch_header_lines(self.stitch_report)
         if self.config_toml:
             lines.append("")
             lines.append("Configuration (TOML)")
@@ -407,6 +433,51 @@ class ReducedDataset:
         return {"dat": dat_path, "plots": plot_paths}
 
 
+def _stitch_header_lines(report: pd.DataFrame | None) -> list[str]:
+    """Build the header block summarizing stitch quality.
+
+    Only boundaries that failed or came out suspect are listed, so a clean
+    reduction collapses to one count line while a questionable one names every
+    problem — the header should never imply a stitch was fine when it was not.
+
+    Args:
+        report: Per-boundary diagnostics, or None if no scaling was applied.
+
+    Returns:
+        Commented-header lines (without the leading ``#``).
+    """
+    lines = ["", "Stitch quality", "-" * 40]
+    if report is None:
+        return lines + ["Stitch scaling : not applied (quick reduction)"]
+    if not len(report):
+        return lines + ["Boundaries     : 0 (no stitch boundaries detected)"]
+
+    counts = summarize_stitches(report)
+    lines.append(
+        f"Boundaries     : {counts['total']} ({counts['ok']} ok, "
+        f"{counts['suspect']} suspect, {counts['failed']} failed)"
+    )
+    failed = report[report["failed"]]
+    suspect = report[report["suspect"] & ~report["failed"]]
+
+    flagged = pd.concat([failed, suspect], ignore_index=True)
+    multi_sample = "sample" in report.columns and report["sample"].nunique() > 1
+    for _, row in flagged.head(_MAX_STITCH_HEADER_LINES).iterrows():
+        tag = "FAILED " if row["failed"] else "SUSPECT"
+        detail = row["fail_reason"] if row["failed"] else row["quality_note"]
+        where = f"{row['sample']} " if multi_sample else ""
+        lines.append(
+            f"  {tag} {where}scan {row['scan']} th={row['sam_th']:.4f} "
+            f"E={row['energy']:g} eV pol={row['polarization']:g}: {detail}"
+        )
+    if len(flagged) > _MAX_STITCH_HEADER_LINES:
+        lines.append(
+            f"  ... and {len(flagged) - _MAX_STITCH_HEADER_LINES} more flagged "
+            "boundaries; run with --diagnostics for the full picture"
+        )
+    return lines
+
+
 def _source_header_lines(index: int, src: SourceProvenance) -> list[str]:
     """Build the header lines describing one source.
 
@@ -418,7 +489,7 @@ def _source_header_lines(index: int, src: SourceProvenance) -> list[str]:
     detector_name = src.config.get("detector_name", "?")
     noise_measured = src.config.get("detector_noise_measured", False)
     noise_note = "" if noise_measured else "  [PLACEHOLDER noise specs]"
-    return [
+    lines = [
         "",
         f"--- Source {index} ---",
         f"Sample name    : {src.sample_name}",
@@ -430,6 +501,14 @@ def _source_header_lines(index: int, src: SourceProvenance) -> list[str]:
         f"sam_th offset  : {src.sam_th_offset} deg",
         f"Detector       : {detector_name}{noise_note}",
     ]
+    if src.header_override:
+        # Records that the per-frame metadata did not come from the FITS files.
+        lines += [
+            "Metadata source: header files, NOT the FITS headers",
+            f"  {src.header_override}",
+            "  nominal (Goal) values drive corrections; q uses the readback (Actual)",
+        ]
+    return lines
 
 
 def _write_ivsq_plot(

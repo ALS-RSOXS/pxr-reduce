@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 # NOTE: heavy scientific imports (pandas, scipy, astropy, matplotlib) are done
 # lazily inside the commands so the CLI prints feedback immediately instead of
@@ -40,6 +44,49 @@ def _configure_logging(verbose: bool) -> None:
     logging.getLogger("pxr_reduce").setLevel(
         logging.DEBUG if verbose else logging.INFO
     )
+
+
+_MAX_STITCH_ECHO_LINES = 10
+
+
+def _echo_stitch_quality(report: pd.DataFrame | None, prefix: str = "") -> None:
+    """Echo the stitch-quality summary, naming every questionable boundary.
+
+    Printed to stdout rather than logged so it is visible at the default verbosity —
+    a mis-scaled stitch is the failure most likely to go unnoticed.
+
+    Args:
+        report: Per-boundary diagnostics from the reduced dataset, or None when no
+            stitch scaling was applied.
+        prefix: Prefix for each line (e.g. ``"[dry-run] "``).
+    """
+    import pandas as pd
+
+    from pxr_reduce.reduction import summarize_stitches
+
+    counts = summarize_stitches(report)
+    if report is None or not counts["total"]:
+        return
+    typer.echo(
+        f"{prefix}Stitches: {counts['total']} ({counts['ok']} ok, "
+        f"{counts['suspect']} suspect, {counts['failed']} failed)"
+    )
+
+    failed = report[report["failed"]]
+    suspect = report[report["suspect"] & ~report["failed"]]
+    flagged = pd.concat([failed, suspect], ignore_index=True)
+    for _, row in flagged.head(_MAX_STITCH_ECHO_LINES).iterrows():
+        tag = "FAILED " if row["failed"] else "SUSPECT"
+        detail = row["fail_reason"] if row["failed"] else row["quality_note"]
+        typer.echo(
+            f"{prefix}  {tag} scan {row['scan']} th={row['sam_th']:.4f} "
+            f"E={row['energy']:g} eV: {detail}"
+        )
+    if len(flagged) > _MAX_STITCH_ECHO_LINES:
+        typer.echo(
+            f"{prefix}  ... and {len(flagged) - _MAX_STITCH_ECHO_LINES} more; see "
+            "the .dat header or --diagnostics"
+        )
 
 
 @app.command("list-detectors")
@@ -112,6 +159,12 @@ def run(
     no_dedup: bool = typer.Option(
         False, "--no-dedup", help="Do not average duplicate (theta, energy, pol) points."
     ),
+    diagnostics: bool = typer.Option(
+        False,
+        "--diagnostics",
+        help="Also write diagnostic plots (counts-vs-theta per energy/pol, beam "
+        "track) to a <sample>_diagnostics/ folder.",
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Report what would be written without writing."
     ),
@@ -176,6 +229,14 @@ def run(
     typer.echo(f"{prefix}Wrote: {result['dat']}")
     for plot in result["plots"]:
         typer.echo(f"{prefix}Plot : {plot}")
+    _echo_stitch_quality(dataset.stitch_report, prefix)
+
+    if diagnostics:
+        from pxr_reduce import diagnostics as diag
+
+        diag_dir = Path(out_path).with_suffix("").parent / f"{Path(out_path).stem}_diagnostics"
+        for path in diag.save_diagnostics(loader, diag_dir, dry_run=dry_run):
+            typer.echo(f"{prefix}Diag : {path}")
 
 
 @app.command()
@@ -194,6 +255,11 @@ def batch(
         "--sample",
         "-s",
         help="Reduce only these sample name(s); repeatable. Default: all.",
+    ),
+    diagnostics: bool = typer.Option(
+        False,
+        "--diagnostics",
+        help="Also write diagnostic plots (counts-vs-theta, beam track) per sample.",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="List what each sample would load and write."
@@ -225,12 +291,19 @@ def batch(
         return
 
     typer.echo(f"Reducing {len(names)} sample(s) with the {config.tracker!r} tracker...")
-    results = run_batch(config, names)
+    results = run_batch(config, names, diagnostics_plots=diagnostics)
     for name, result in results.items():
         if "error" in result:
             typer.echo(f"FAILED {name}: {result['error']}")
-        else:
-            typer.echo(f"Wrote  {name} -> {result['dat']}")
+            continue
+        stitches = result.get("stitches", {})
+        note = ""
+        if stitches.get("suspect") or stitches.get("failed"):
+            note = (
+                f"  [stitches: {stitches['suspect']} suspect, "
+                f"{stitches['failed']} failed - check the .dat header]"
+            )
+        typer.echo(f"Wrote  {name} -> {result['dat']}{note}")
 
 
 @app.command("scan-samples")

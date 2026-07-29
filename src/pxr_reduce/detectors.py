@@ -111,18 +111,57 @@ class DetectorSpec:
         dark_var_adu2 = self.dark_current_adu_per_s * exposure_s
         return shot_var_adu2 + self.read_noise_adu**2 + dark_var_adu2
 
-    def is_saturated(self, image: NDArray[np.floating], threshold: float = 1.0) -> bool:
-        """Return True if the image approaches the detector saturation level.
+    def saturated_mask(
+        self, image: NDArray[np.floating], threshold: float = 1.0
+    ) -> NDArray[np.bool_]:
+        """Boolean mask of pixels within ``threshold`` ADU of saturation.
+
+        This is the single definition of "saturated pixel"; :meth:`is_saturated`
+        and :meth:`count_saturated` both derive from it, so a saturation flag can
+        never disagree with a saturated-pixel count.
 
         Args:
-            image: Raw image in ADU.
+            image: Image (or ROI) in ADU.
+            threshold: How close (in ADU) a pixel must be to
+                :attr:`saturation_adu` to count as saturated.
+
+        Returns:
+            Boolean array the same shape as ``image``.
+        """
+        return np.asarray(image) > self.saturation_adu - threshold
+
+    def count_saturated(
+        self, image: NDArray[np.floating], threshold: float = 1.0
+    ) -> int:
+        """Return how many pixels of ``image`` are saturated.
+
+        Args:
+            image: Image (or ROI) in ADU.
+            threshold: Distance (ADU) from :attr:`saturation_adu` counting as
+                saturated.
+
+        Returns:
+            The number of saturated pixels (0 for an empty array).
+        """
+        return int(self.saturated_mask(image, threshold).sum())
+
+    def is_saturated(self, image: NDArray[np.floating], threshold: float = 1.0) -> bool:
+        """Return True if any pixel of ``image`` is within ``threshold`` of saturation.
+
+        Pass the *integrated ROI*, not a whole frame: saturation only matters where
+        it corrupts the counts being measured. An empty array (a ROI clipped away at
+        a frame edge) is reported as not saturated; callers should check for that
+        separately, since its counts are meaningless either way.
+
+        Args:
+            image: Image (or ROI) in ADU.
             threshold: How close (in ADU) the peak pixel must be to
                 :attr:`saturation_adu` to count as saturated.
 
         Returns:
-            True if the brightest pixel is within ``threshold`` ADU of saturation.
+            True if any pixel is within ``threshold`` ADU of saturation.
         """
-        return bool((self.saturation_adu - np.asarray(image).max()) < threshold)
+        return bool(self.saturated_mask(image, threshold).any())
 
     def to_header_dict(self) -> dict[str, Any]:
         """Return a flat, serializable mapping for export headers."""

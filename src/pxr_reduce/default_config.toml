@@ -53,6 +53,17 @@ drop_duplicates = true
 # --- Detector -----------------------------------------------------------------
 detector = "default"          # registered detector name (see `pxr-reduce list-detectors`)
 
+# --- Metadata source ----------------------------------------------------------
+# Directory of beamline scan header files (one .txt per scan). When set, the motor
+# columns that those files record as a "Goal"/"Actual" pair override the per-frame
+# FITS metadata; frames are matched by the FITS filename each header row names.
+# "Goal" drives every correction (scan splitting, theta offset, stitch detection and
+# overlap matching); q is computed from "Actual". Everything else — exposure, slit
+# apertures, beam current, I0, polarization — still comes from the FITS headers.
+# A relative path is resolved against this config file. Omit it entirely to use the
+# FITS metadata as-is (the default).
+# header = "headers"
+
 # --- Metadata / geometry ------------------------------------------------------
 exposure_offset = 0.00389278  # shutter open/close time added to exposure [s]
 energy_resolution = 20.0      # energy rounded to round(E*res)/res eV
@@ -86,6 +97,13 @@ drop_failed_stitch = true     # drop points that fail to stitch
 stitch_condition_columns = ["hos", "exposure", "slits_vert", "slits_horz"]
 stitch_condition_tol = 0.0    # a watched column must change by more than this
 stitch_theta_backstep = 0.001 # a sam_th decrease larger than this [deg] marks a boundary
+
+# --- Stitch-quality checks (diagnostic only; no data is dropped) ---------------
+# Conditions already divided out of the reflectivity, so a boundary triggered only
+# by these (or by a bare back-step) must fit a scale of ~1.0 and is checkable.
+stitch_normalized_conditions = ["exposure"]
+stitch_max_overlap_rms = 0.20      # flag when overlap points disagree by more (rel. rms)
+stitch_max_scale_deviation = 0.10  # flag when the scale is further from the expected one
 
 # Map sample names to their scan IDs (the static 5-digit block in the filenames).
 # A sample pools every frame from all listed scans into one reduction, e.g.:

@@ -10,8 +10,65 @@ from pxr_reduce.dataset import (
     _q_uncertainty,
     _round_to_decimals,
     _round_value_and_error,
+    _stitch_header_lines,
 )
 from pxr_reduce.provenance import ReductionProvenance
+
+
+def _stitch_report(rows: list[dict]) -> pd.DataFrame:
+    """Build a minimal diagnose_stitches-shaped report."""
+    return pd.DataFrame(rows)
+
+
+_OK_BOUNDARY = {
+    "sample": "S1", "scan": 0, "sam_th": 0.3, "energy": 250.0, "polarization": 100.0,
+    "failed": False, "suspect": False, "fail_reason": "", "quality_note": "",
+}
+_SUSPECT_BOUNDARY = {
+    **_OK_BOUNDARY, "sam_th": 0.45, "suspect": True,
+    "quality_note": "scale 1.4 is 40.0% from the expected 1",
+}
+_FAILED_BOUNDARY = {
+    **_OK_BOUNDARY, "sam_th": 0.6, "failed": True,
+    "fail_reason": "no overlapping stitch points",
+}
+
+
+def test_stitch_header_reports_counts_and_lists_only_problems():
+    lines = _stitch_header_lines(
+        _stitch_report([_OK_BOUNDARY, _SUSPECT_BOUNDARY, _FAILED_BOUNDARY])
+    )
+    text = "\n".join(lines)
+    assert "3 (1 ok, 1 suspect, 1 failed)" in text
+    assert "FAILED" in text and "no overlapping stitch points" in text
+    assert "SUSPECT" in text and "40.0% from the expected" in text
+    # A clean boundary is counted but not listed, so the block stays short.
+    assert "th=0.3000" not in text
+
+
+def test_stitch_header_for_clean_reduction_is_one_line():
+    lines = _stitch_header_lines(_stitch_report([_OK_BOUNDARY]))
+    text = "\n".join(lines)
+    assert "1 (1 ok, 0 suspect, 0 failed)" in text
+    assert "SUSPECT" not in text and "FAILED" not in text
+
+
+@pytest.mark.parametrize(
+    "report,expected",
+    [
+        (None, "not applied (quick reduction)"),
+        (pd.DataFrame(), "no stitch boundaries detected"),
+    ],
+)
+def test_stitch_header_distinguishes_no_scaling_from_no_boundaries(report, expected):
+    assert expected in "\n".join(_stitch_header_lines(report))
+
+
+def test_stitch_header_caps_the_flagged_list():
+    many = [dict(_FAILED_BOUNDARY, sam_th=0.1 * i) for i in range(25)]
+    text = "\n".join(_stitch_header_lines(_stitch_report(many)))
+    assert text.count("FAILED") == 20
+    assert "and 5 more flagged boundaries" in text
 
 
 @pytest.fixture
@@ -43,7 +100,17 @@ def test_header_lines_contain_key_provenance(dataset):
     assert "Reduction time" in header
     assert "Source 1" in header
     assert "PLACEHOLDER noise specs" in header  # default detector is placeholder
+    assert "Stitch quality" in header
     assert "Columns:" in header
+
+
+def test_quick_reduction_header_records_that_scaling_was_skipped(
+    processed_loader_factory,
+):
+    loader = processed_loader_factory()
+    quick = ReducedDataset.from_loader(loader, apply_scale=False)
+    assert quick.stitch_report is None
+    assert "not applied (quick reduction)" in "\n".join(quick.header_lines())
 
 
 def test_save_dat_writes_and_roundtrips(dataset, tmp_path):

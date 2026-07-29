@@ -119,6 +119,20 @@ def test_run_no_matching_files_errors(tmp_path):
     assert result.exit_code != 0
 
 
+def test_run_diagnostics_creates_folder(synthetic_scan_folder, tmp_path):
+    folder = synthetic_scan_folder()
+    results = tmp_path / "results"
+    result = runner.invoke(
+        app,
+        ["run", str(folder), "--results-dir", str(results),
+         "--roi-height", "9", "--roi-width", "9", "--no-plots", "--diagnostics"],
+    )
+    assert result.exit_code == 0, result.stdout
+    diag_dirs = list(results.glob("*_diagnostics"))
+    assert diag_dirs, "no *_diagnostics folder created"
+    assert list(diag_dirs[0].glob("*.png"))
+
+
 def test_run_with_config_file(synthetic_scan_folder, tmp_path):
     from pxr_reduce.config import ReductionConfig
     from pxr_reduce.run_config import RunConfig, run_config_to_toml_str

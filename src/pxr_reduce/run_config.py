@@ -177,7 +177,15 @@ def load_run_config(path: Path | str | None) -> RunConfig:
             kwargs[key] = Path(value) if key in _PATH_FIELDS else value
 
     if "reduction" in raw:
-        kwargs["reduction"] = ReductionConfig.from_dict(raw["reduction"])
+        reduction_config = ReductionConfig.from_dict(raw["reduction"])
+        # A relative header directory is resolved against the config file, so a config
+        # and its header files can be moved together and referenced from any cwd.
+        if (
+            reduction_config.header is not None
+            and not reduction_config.header.is_absolute()
+        ):
+            reduction_config.header = path.parent / reduction_config.header
+        kwargs["reduction"] = reduction_config
     if "samples" in raw:
         kwargs["samples"] = {
             str(name): [int(s) for s in _as_list(scans)]
