@@ -100,12 +100,16 @@ class SourceProvenance:
         n_scans: Number of distinct scans.
         energies: Sorted unique photon energies present (eV).
         polarizations: Sorted unique polarizations present.
-        sam_th_offset: Sample-theta offset applied (deg).
+        sam_th_offsets: Sample-theta offset applied (deg), per scan. Scans pooled into
+            one sample are aligned separately and do not share an offset.
         config: Flattened reduction config + detector specification.
         collection_time_start: Earliest collection timestamp (ISO), if known.
         collection_time_end: Latest collection timestamp (ISO), if known.
         header_override: Summary of the header-file metadata override, or None when
             the FITS metadata was used as collected.
+        n_frames_dropped: Frames excluded because no header file described them.
+        substituted_headers: Monitor headers the FITS files did not record, for which
+            a neutral value was substituted.
     """
 
     sample_name: str
@@ -114,11 +118,13 @@ class SourceProvenance:
     n_scans: int
     energies: list[float]
     polarizations: list[float]
-    sam_th_offset: float
+    sam_th_offsets: dict[Any, float]
     config: dict[str, Any]
     collection_time_start: str | None = None
     collection_time_end: str | None = None
     header_override: str | None = None
+    n_frames_dropped: int = 0
+    substituted_headers: list[str] = field(default_factory=list)
 
 
 def build_source_provenance(
@@ -152,7 +158,10 @@ def build_source_provenance(
         n_scans=int(data["scan"].nunique()) if "scan" in data else 0,
         energies=sorted({round(float(e), 6) for e in src["energy"].unique()}),
         polarizations=sorted({round(float(p), 6) for p in src["polarization"].unique()}),
-        sam_th_offset=float(loader.sam_th_offset_applied),
+        sam_th_offsets={
+            key: float(value)
+            for key, value in getattr(loader, "sam_th_offsets_applied", {}).items()
+        },
         config=config,
         collection_time_start=start,
         collection_time_end=end,
@@ -161,6 +170,8 @@ def build_source_provenance(
             if (override := getattr(loader, "header_override", None)) is not None
             else None
         ),
+        n_frames_dropped=(override.n_dropped_frames if override is not None else 0),
+        substituted_headers=list(getattr(loader, "substituted_headers", ()) or ()),
     )
 
 

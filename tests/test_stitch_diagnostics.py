@@ -120,9 +120,11 @@ def test_save_stitch_diagnostics_writes_scan_folder_and_summary(
         assert path.exists() and path.stat().st_size > 0
     assert (out / "stitch_summary.md").exists()
     assert (out / "dropped_points.md").exists()
-    assert list((out / "scan_00").glob("boundary_*.png"))
+    sweep_dirs = [p for p in out.iterdir() if p.is_dir()]
+    assert len(sweep_dirs) == 1 and sweep_dirs[0].name.startswith("id")
+    assert list(sweep_dirs[0].glob("boundary_*.png"))
     # Only saturated frames that cost a stitch point get an ROI image.
-    assert (out / "scan_00" / "saturated" / "frame_00004_roi.png").exists()
+    assert list(out.glob("id*/saturated/frame_00004_roi.png"))
 
 
 def test_summary_names_the_file_and_reason_for_each_dropped_point(
@@ -138,14 +140,15 @@ def test_summary_names_the_file_and_reason_for_each_dropped_point(
     assert "partner dropped" in text
     # The source FITS file and the ROI image are both named.
     assert "MF999A_4.fits" in text
-    assert "scan_00/saturated/frame_00004_roi.png" in text
+    assert "/saturated/frame_00004_roi.png" in text
+    assert "id999_sweep0_E250_P100" in text
     # Saturation semantics are stated, so the report is self-explaining.
     assert "integrated beam ROI" in text
     # Markdown structure: headings, a table, and the figure embedded.
     assert text.startswith("# Stitch diagnostics")
     assert "### Boundary 01" in text
     assert "|---|" in text
-    assert "![Boundary 01](scan_00/boundary_01.png)" in text
+    assert "![Boundary 01](id999_sweep0_E250_P100/boundary_01.png)" in text
 
 
 def test_dropped_points_markdown_carries_full_paths(stitch_loader, tmp_path):
@@ -176,7 +179,7 @@ def test_summary_lists_saturated_frames_that_are_not_stitch_points(
     assert "## Saturated frames" in text
     assert "MF999A_9.fits" in text
     assert "not a stitch overlap candidate" in text
-    assert not (out / "scan_00" / "saturated" / "frame_00009_roi.png").exists()
+    assert not list(out.glob("id*/saturated/frame_00009_roi.png"))
 
 
 def test_save_stitch_diagnostics_dry_run_writes_nothing(stitch_loader, tmp_path):
@@ -246,9 +249,14 @@ def test_saturated_roi_figure_marks_beam_and_saturated_pixels(stitch_loader):
     assert "32 px in ROI" in ax.get_title()
 
 
-@pytest.mark.parametrize("scan_id,expected", [(0, "scan_00"), (7, "scan_07")])
-def test_scan_dir_name(scan_id, expected):
-    assert sd._scan_dir_name(scan_id) == expected
+def test_scan_dir_name_uses_the_sweep_tag():
+    import pandas as pd
+
+    boundaries = pd.DataFrame(
+        {"scan_id": [2045, 2045], "sweep": [3, 3],
+         "energy": [283.5, 283.5], "polarization": [100.0, 100.0]}
+    )
+    assert sd._scan_dir_name(boundaries) == "id2045_sweep3_E283.5_P100"
 
 
 def test_by_scan_tolerates_a_sample_with_no_boundaries():

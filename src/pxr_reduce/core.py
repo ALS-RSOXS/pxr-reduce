@@ -28,6 +28,7 @@ from tqdm.auto import tqdm
 
 from pxr_reduce import (
     beam_fit,
+    discovery,
     header_file,
     image_ops,
     metadata,
@@ -87,13 +88,15 @@ class PXRLoader:
         cache_size: int = 64,
         index_by_position: bool = False,
         name: str | None = None,
+        scan_ids: dict[Path, int] | None = None,
     ) -> None:
         self.config = config or ReductionConfig()
         self.data_processed = False
         self.mask: NDArray[np.bool_] | None = None
-        self.sam_th_offset_applied: float = 0.0
+        self.sam_th_offsets_applied: dict[Any, float] = {}
         self.beam_shape: BeamShape | None = None
         self.header_override: header_file.OverrideReport | None = None
+        self.substituted_headers: tuple[str, ...] = ()
 
         logger.info("Loading %d file(s) — reading headers...", len(files))
         paths = self._validate_files(files)
@@ -116,7 +119,7 @@ class PXRLoader:
             {index_by_path[p]: p for p in self.files}, cache_size=cache_size
         )
 
-        self.data = self._load_metadata(index_by_path)
+        self.data = self._load_metadata(index_by_path, scan_ids)
         logger.info("Loaded %d frames for sample %r", len(self), self.name)
 
         if auto_process:
@@ -159,12 +162,50 @@ class PXRLoader:
         trimmed = re.sub(r"[ _\-]*\d+(?:[ _\-]\d+)*$", "", path.stem)
         return trimmed or path.stem
 
-    def _load_metadata(self, index_by_path: dict[Path, int]) -> pd.DataFrame:
+    def _resolve_scan_ids(self, scan_ids: dict[Path, int] | None) -> dict[Path, int]:
+        """Return a scan ID per file, preferring the caller's authoritative mapping.
+
+        Batch reductions know each frame's scan ID from ``[samples]``. Anything else
+        (the single-folder CLI, notebooks) has it inferred from the filenames, where
+        an unresolvable convention yields -1.
+        """
+        if scan_ids is not None:
+            missing = [p for p in self.files if p not in scan_ids]
+            if not missing:
+                return {p: int(scan_ids[p]) for p in self.files}
+            logger.warning(
+                "%d file(s) were not in the supplied scan-ID map; inferring from "
+                "filenames instead.",
+                len(missing),
+            )
+        inferred = discovery.scan_ids_for(p.name for p in self.files)
+        resolved = {p: inferred.get(p.name) for p in self.files}
+        unknown = [p for p, sid in resolved.items() if sid is None]
+        if unknown:
+            logger.warning(
+                "Could not infer a scan ID for %d file(s); recording -1. Per-scan "
+                "corrections will fall back to the sweep label.",
+                len(unknown),
+            )
+        return {p: (-1 if sid is None else int(sid)) for p, sid in resolved.items()}
+
+    def _load_metadata(
+        self,
+        index_by_path: dict[Path, int],
+        scan_ids: dict[Path, int] | None = None,
+    ) -> pd.DataFrame:
+        by_path = self._resolve_scan_ids(scan_ids)
         records: list[dict[str, Any]] = []
         for p in tqdm(self.files, desc="Loading FITS headers", unit="file"):
             record = read_fits_header(p)
             record["fits_index"] = index_by_path[p]
+            record["scan_id"] = by_path[p]
             records.append(record)
+        self.substituted_headers = tuple(
+            key
+            for key in sorted(metadata.OPTIONAL_HEADERS)
+            if records and key not in records[0]
+        )
         table = metadata.build_metadata_table(records, self.config)
         # The FITS metadata is stored first, then overridden, so every downstream
         # correction (scan labelling, theta offset, q) sees the corrected values.
@@ -173,7 +214,12 @@ class PXRLoader:
             table, self.header_override = header_file.apply_override(
                 table, filenames, self.config
             )
-        table, self.sam_th_offset_applied = metadata.prepare_metadata(
+            # Frames with no header row are dropped from the table; keep self.files in
+            # step so len(loader), path_for(), and the diagnostics all agree.
+            if self.header_override.n_dropped_frames:
+                kept = set(table["fits_index"])
+                self.files = [p for p in self.files if index_by_path[p] in kept]
+        table, self.sam_th_offsets_applied = metadata.prepare_metadata(
             table, self.config
         )
         return table
@@ -594,6 +640,58 @@ class PXRLoader:
             shapes.append(beam_fit.estimate_moments(window))
         return beam_fit.aggregate_shapes(shapes)
 
+    def _warn_clipped_rois(self) -> None:
+        """Report frames whose beam ROI ran off the edge of the trimmed frame.
+
+        Raised once for the whole scan, naming the frames and their beam positions in
+        *trimmed-frame* coordinates, because that is what the user can act on: a
+        per-frame warning from the integrator would flood the log and could only quote
+        coordinates inside the tracker's cropped search region.
+
+        A clipped ROI almost always means the beam was lost rather than that the ROI is
+        too large — once reflectivity falls below the noise floor the tracker follows
+        the brightest noise pixel and random-walks into an edge. Shrinking the ROI does
+        not help, because noise peaks land *on* the edge.
+        """
+        expected = self.config.roi_height * self.config.roi_width
+        pixels = self.data["n_roi_pixels"].to_numpy()
+        clipped = pixels < expected
+        if not clipped.any():
+            return
+
+        height, width = image_ops.trim(
+            self._store.get(int(self.data["fits_index"].iloc[0])),
+            self.config.trim_x,
+            self.config.trim_y,
+        ).shape[:2]
+        affected = self.data.loc[clipped, ["fits_index", "beam_spot", "n_roi_pixels"]]
+        empty = int((pixels == 0).sum())
+        shown = ", ".join(
+            f"{int(row.fits_index)}@{tuple(row.beam_spot)}"
+            for row in affected.head(6).itertuples()
+        )
+        more = "" if len(affected) <= 6 else f" (+{len(affected) - 6} more)"
+        logger.warning(
+            "%d of %d frame(s) have a beam ROI clipped by the trimmed frame edge "
+            "(%dx%d px frame, %dx%d ROI needs %d px of margin around the beam). "
+            "counts_spot is summed over fewer than %d px, so those points read low"
+            "%s. Frames (fits_index@beam y,x): %s%s. This usually means the beam was "
+            "lost: past the angle where reflectivity drops below the noise floor the "
+            "tracker follows noise and drifts to an edge, so a smaller ROI will not "
+            "help. Check n_roi_pixels in loader.data.",
+            int(clipped.sum()),
+            len(self.data),
+            height,
+            width,
+            self.config.roi_height,
+            self.config.roi_width,
+            max(self.config.roi_height, self.config.roi_width) // 2,
+            expected,
+            f", and {empty} read exactly zero (ROI entirely off-frame)" if empty else "",
+            shown,
+            more,
+        )
+
     def _assemble_counts(self, results: list[image_ops.FrameIntegration]) -> None:
         """Fold per-frame integration results and normalization into the table."""
         exposure = self.data["exposure"].to_numpy()
@@ -607,6 +705,8 @@ class PXRLoader:
         self.data["is_saturated"] = [r.is_saturated for r in results]
         self.data["n_sat_roi"] = [r.n_sat_roi for r in results]
         self.data["n_sat_dark"] = [r.n_sat_dark for r in results]
+        self.data["n_roi_pixels"] = [r.n_roi_pixels for r in results]
+        self._warn_clipped_rois()
         net_value = np.array([r.net.value for r in results])
         net_sigma = np.array([r.net.sigma for r in results])
         self.data["counts_refl"] = net_value / norm
@@ -619,16 +719,19 @@ class PXRLoader:
         *,
         apply_scale: bool = True,
         drop_duplicates: bool = True,
+        duplicate_scope: str = "sweep",
     ) -> pd.DataFrame:
         """Reduce the processed data to a 1D reflectivity dataset.
 
         Args:
             apply_scale: If False, skip stitch detection/scaling (quick preview).
-            drop_duplicates: Average points sharing (sam_th, energy, polarization).
+            drop_duplicates: Average points sharing the duplicate key.
+            duplicate_scope: Granularity of that key; see
+                :func:`pxr_reduce.reduction.finalize`.
 
         Returns:
-            The reduced dataset (columns: scan, energy, polarization, sam_th, q,
-            R, R_err).
+            The reduced dataset (columns: scan_id, sweep, energy, polarization,
+            sam_th, q, R, R_err).
 
         Raises:
             RuntimeError: If :meth:`process` has not been run.
@@ -640,6 +743,7 @@ class PXRLoader:
             self.config,
             apply_scale=apply_scale,
             drop_duplicates=drop_duplicates,
+            duplicate_scope=duplicate_scope,
         )
 
     def diagnose_stitches(self) -> pd.DataFrame:

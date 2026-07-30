@@ -18,11 +18,12 @@ parent_dir = "path/to/beamtime"
 results_root = "results"
 # Glob used to find FITS files under parent_dir.
 fits_glob = "*.fits"
-# Width (digits) of the static scan-ID block in a filename, e.g. 89854. Used by
-# discovery to tell the scan ID apart from the (usually zero-padded) frame index.
-scan_number_width = 5
-# Optional regex overriding scan-ID extraction; must expose a `scan` group, e.g.
-# 'XRR_(?P<scan>\d{5})'. Leave commented to use the width-based default.
+# Scan IDs in [samples] are matched against every digit block in a filename
+# numerically, so zero-padding does not matter: 2045 below matches "... 002045 ...".
+# The frame counter is identified as the one block that moves across a scan's files,
+# and any other digits (sample-name numbers) are ignored. No width setting is needed.
+# Optional regex overriding scan-ID extraction, for a convention the automatic
+# analysis cannot handle; must expose a `scan` group, e.g.:
 # scan_number_regex = 'XRR_(?P<scan>\d{5})'
 
 [tracking]
@@ -46,8 +47,14 @@ angle_decimals = 4
 plots = true
 # Apply stitch scaling (false = I0-normalized quick reduction only).
 apply_scale = true
-# Average points sharing (sam_th, energy, polarization).
+# Average duplicate points.
 drop_duplicates = true
+# Granularity of "duplicate". "sweep" (default) exports every sweep as its own
+# profile, so two sweeps sharing an energy/polarization stay as two curves -- an
+# accidental duplicate is then visible instead of being silently averaged away.
+# "scan" merges repeat sweeps within a scan; "angle" merges everything sharing
+# (sam_th, energy, polarization). Overlap points within one sweep always average.
+duplicate_scope = "sweep"
 
 [reduction]
 # --- Detector -----------------------------------------------------------------

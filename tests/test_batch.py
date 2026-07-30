@@ -88,8 +88,8 @@ def test_reduce_sample_with_diagnostics(beamtime, tmp_path):
     cfg = _config(beamtime, out, {"GlassA": [90001]})
     result = reduce_sample(cfg, "GlassA", progress=False, diagnostics_plots=True)
     assert "diagnostics" in result
-    assert (out / "GlassA_diagnostics" / "beam_track.png").exists()
-    assert list((out / "GlassA_diagnostics").glob("counts_vs_theta_*.png"))
+    assert list((out / "GlassA_diagnostics").glob("BeamTrack_id*_sweep*.png"))
+    assert list((out / "GlassA_diagnostics").glob("RawCounts__id*_sweep*.png"))
 
 
 def test_batch_dat_embeds_full_run_config(beamtime, tmp_path):

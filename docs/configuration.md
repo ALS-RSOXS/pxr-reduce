@@ -134,8 +134,37 @@ documented starter with `pxr-reduce init-config`. Sections:
 | `parent_dir` | path | `"data"` | Folder searched recursively for FITS scans. |
 | `results_root` | path | `"results"` | Where `<sample>.dat` + plots are written. |
 | `fits_glob` | `str` | `"*.fits"` | Glob for FITS files under `parent_dir`. |
-| `scan_number_width` | `int` | `5` | Digit width of the static scan-ID block in filenames (distinguishes it from the frame index). |
-| `scan_number_regex` | `str \| None` | `None` | Optional regex with a `scan` group overriding the width-based rule. |
+| `scan_number_regex` | `str \| None` | `None` | Optional regex with a `scan` group, for a naming convention the automatic analysis cannot handle. |
+
+Scan IDs in `[samples]` are matched against every digit block in a filename
+**numerically**, so zero-padding is irrelevant — `2045` matches `... 002045 ...`. The
+frame counter is identified as the block that *moves* across a scan's files (a dense,
+zero-based run), and any other digits are treated as part of the sample name. Nothing
+depends on the scan ID's position, its digit width, or the separators used, so a
+convention change between beamtimes needs no config change. These all work as-is:
+
+```text
+TCTA_0_P100_ 002045 CCD 002.fits     scan=2045   frame=2
+From File Scan 006285 CCD 000.fits   scan=6285   frame=0
+T25 006288 CCD 001.fits              scan=6288   frame=1
+B1A1_XRR_P100_17344_000.fits         scan=17344  frame=0
+B1A1_NEdge_XRR_89854-00001.fits      scan=89854  frame=1
+```
+
+Write scan IDs in `[samples]` **without** leading zeros — TOML rejects `002045` as an
+integer (`Unclosed array`), and padding does not affect matching anyway.
+
+Each frame's scan ID is recorded in a `scan_id` column and exported as the **first**
+column of the `.dat`, so every point traces back to the scan that produced it. The
+sample-theta offset is determined and applied **per scan ID**: scans pooled into one
+sample were aligned separately and do not share it (measured offsets of −0.0140° and
++0.0420° for the two scans of one sample are typical, and applying one to both puts
+their curves on visibly different q grids). Because of that, points from different
+scans are *not* averaged together even when they share (sam_th, energy, polarization);
+repeat sweeps within a single scan still are.
+
+> The former `scan_number_width` setting has been removed. An existing config that
+> still sets it will load with an "Unknown key" warning; delete the line.
 
 **`[tracking]`**
 
@@ -152,7 +181,8 @@ documented starter with `pxr-reduce init-config`. Sections:
 | `angle_decimals` | `int` | `4` | Decimals kept for `sam_th`; also sets the angular step propagated onto q for its significant-figure rounding. |
 | `plots` | `bool` | `True` | Write I-vs-q PNGs alongside each `.dat`. |
 | `apply_scale` | `bool` | `True` | Apply stitch scaling (False = quick reduction). |
-| `drop_duplicates` | `bool` | `True` | Average points sharing (sam_th, energy, polarization). |
+| `drop_duplicates` | `bool` | `True` | Average duplicate points. |
+| `duplicate_scope` | `str` | `"sweep"` | Granularity of "duplicate": `"sweep"` keeps every sweep as its own profile, `"scan"` merges repeat sweeps within a scan, `"angle"` merges everything sharing (sam_th, energy, polarization). Overlap points within one sweep always average. |
 
 **`[reduction]`** — any `ReductionConfig` field from this page.
 

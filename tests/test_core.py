@@ -160,6 +160,43 @@ def test_process_tracks_moving_beam_and_ignores_noise(tmp_path, fits_writer, fra
         assert y > 15, f"frame {i} jumped toward noise: row {y}"
 
 
+def test_clipped_roi_is_reported_once_with_frame_context(
+    tmp_path, fits_writer, frame_builders, caplog
+):
+    # Beam walks toward the bottom edge until the ROI no longer fits. The report must
+    # name the frames and their trimmed-frame positions -- the integrator sees only the
+    # tracker's cropped region, whose coordinates mean nothing to the caller.
+    _, frame_header = frame_builders
+    files = []
+    for i in range(6):
+        img = np.full((80, 80), 5.0)
+        _add_gauss(img, (40 + 6 * i, 40), 20000.0)  # marches down toward the edge
+        fits_writer(tmp_path / f"EDGE_{i}.fits", img, frame_header(float(i), 1.0))
+        files.append(tmp_path / f"EDGE_{i}.fits")
+
+    cfg = ReductionConfig(
+        roi_height=11, roi_width=11, trim_x=10, trim_y=10,
+        dark_pix_offset=4, drift_distance=8,
+    )
+    loader = PXRLoader(files, cfg)
+    with caplog.at_level("WARNING"):
+        loader.process()
+
+    expected = cfg.roi_height * cfg.roi_width
+    clipped = loader.data[loader.data["n_roi_pixels"] < expected]
+    assert len(clipped) >= 1, "expected the beam to reach the edge"
+    assert (loader.data["n_roi_pixels"] <= expected).all()
+
+    text = caplog.text
+    assert "clipped by the trimmed frame edge" in text
+    assert "60x60 px frame" in text          # 80 minus 10 trim on each side
+    assert "fits_index@beam y,x" in text
+    # Raised once for the scan, not once per frame.
+    assert text.count("clipped by the trimmed frame edge") == 1
+    # And it says a smaller ROI is not the fix.
+    assert "smaller ROI will not help" in text
+
+
 def test_direct_beam_at_different_position_normalizes_positive(tmp_path, fits_writer, frame_builders):
     from pxr_reduce.config import ReductionConfig
     from pxr_reduce.core import PXRLoader

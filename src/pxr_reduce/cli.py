@@ -312,7 +312,12 @@ def scan_samples(
         ..., exists=True, file_okay=False, help="Parent folder to search recursively."
     ),
     pattern: str = typer.Option("*.fits", "--pattern", help="Glob for FITS files."),
-    width: int = typer.Option(5, "--width", help="Scan-ID digit width."),
+    scan_regex: str | None = typer.Option(
+        None,
+        "--scan-regex",
+        help="Regex with a 'scan' group, for a convention the automatic "
+        "moving-vs-static block analysis cannot handle.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging."),
 ) -> None:
     """Discover scans under PARENT and print a ready-to-paste [samples] map."""
@@ -320,7 +325,7 @@ def scan_samples(
 
     from pxr_reduce.discovery import discover_samples, suggest_sample_map
 
-    scans = discover_samples(parent, glob=pattern, width=width)
+    scans = discover_samples(parent, glob=pattern, regex=scan_regex)
     if not scans:
         typer.echo(f"No FITS scans found under {parent}.")
         return
@@ -330,7 +335,7 @@ def scan_samples(
 
     typer.echo("\nSuggested [samples] (paste into your config, edit names):\n")
     typer.echo("[samples]")
-    for name, ids in suggest_sample_map(parent, glob=pattern, width=width).items():
+    for name, ids in suggest_sample_map(parent, glob=pattern, regex=scan_regex).items():
         typer.echo(f"{name} = {ids}")
 
 

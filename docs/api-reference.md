@@ -65,7 +65,9 @@ sample name.
 | `get_clean_image(fits_index) -> ndarray` | Trimmed + dezingered frame. |
 | `__call__(**kwargs)` | Alias for `reduce`. |
 
-`reduce()` returns columns: `scan, energy, polarization, sam_th, q, R, R_err`.
+`reduce()` returns columns: `scan_id, energy, polarization, sam_th, q, R, R_err`. Points from
+different scans stay separate (each scan carries its own sample-theta offset), so every
+point is traceable to its source scan; repeat sweeps within one scan are averaged.
 
 ---
 
@@ -147,7 +149,7 @@ Composable reduction stages. Each takes the counts table and a `ReductionConfig`
 | `compute_scale_factors(df, config) -> DataFrame` | Fit and accumulate stitch scale factors. |
 | `apply_scaling(df, config) -> DataFrame` | Divide R by scale, propagate error. |
 | `finalize(df, config, drop_duplicates=True) -> DataFrame` | Mask invalid points, select output. |
-| `diagnose_stitches(df, config) -> DataFrame` | Per-boundary diagnostics (no finalize): `scan, fits_index, sam_th, energy, polarization, trigger, conditions_changed, num_stitch_points, scale, scale_err, failed`. |
+| `diagnose_stitches(df, config, *, annotated=None) -> DataFrame` | Per-boundary diagnostics (no finalize): `scan, boundary_index, fits_index, sam_th, energy, polarization, trigger, conditions_changed, num_stitch_points, scale, scale_err, failed`. |
 | `stitch_ratio_model(r, scale) -> ndarray` | `curve_fit` model `y = scale·r`. |
 
 ---

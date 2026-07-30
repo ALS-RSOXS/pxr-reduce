@@ -40,7 +40,6 @@ class RunConfig:
         parent_dir: Folder searched (recursively) for the FITS scans.
         results_root: Directory into which ``<sample>.dat`` files are written.
         fits_glob: Glob used to find FITS files under ``parent_dir``.
-        scan_number_width: Digit width of the static scan-ID block in filenames.
         scan_number_regex: Optional regex overriding scan-ID extraction; must
             expose a ``scan`` capture group. ``None`` uses the width-based rule.
         tracker: Beam tracker to use: ``"simple"`` or ``"base"``.
@@ -52,7 +51,10 @@ class RunConfig:
             angular step propagated onto q).
         plots: Whether to write I-vs-q PNGs alongside each ``.dat``.
         apply_scale: Whether to apply stitch scaling (False = quick reduction).
-        drop_duplicates: Average points sharing (sam_th, energy, polarization).
+        drop_duplicates: Average points sharing the duplicate key.
+        duplicate_scope: Granularity of that key — "sweep" (default) exports every
+            sweep as its own profile, "scan" merges repeat sweeps within a scan,
+            "angle" merges everything sharing (sam_th, energy, polarization).
         reduction: The reduction parameters (image processing, stitching, ...).
         samples: Map of sample name to the list of scan IDs composing it.
     """
@@ -61,7 +63,6 @@ class RunConfig:
     parent_dir: Path = Path("data")
     results_root: Path = Path("results")
     fits_glob: str = "*.fits"
-    scan_number_width: int = 5
     scan_number_regex: str | None = None
 
     # [tracking]
@@ -74,6 +75,7 @@ class RunConfig:
     plots: bool = True
     apply_scale: bool = True
     drop_duplicates: bool = True
+    duplicate_scope: str = "sweep"
 
     # [reduction]
     reduction: ReductionConfig = field(default_factory=ReductionConfig)
@@ -96,11 +98,16 @@ _SECTIONS: dict[str, tuple[str, ...]] = {
         "parent_dir",
         "results_root",
         "fits_glob",
-        "scan_number_width",
         "scan_number_regex",
     ),
     "tracking": ("tracker", "search_radius", "filter_size"),
-    "export": ("angle_decimals", "plots", "apply_scale", "drop_duplicates"),
+    "export": (
+        "angle_decimals",
+        "plots",
+        "apply_scale",
+        "drop_duplicates",
+        "duplicate_scope",
+    ),
 }
 _PATH_FIELDS: frozenset[str] = frozenset({"parent_dir", "results_root"})
 # Fields that may be omitted from the TOML, meaning "unset" (None).

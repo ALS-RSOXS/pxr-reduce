@@ -32,21 +32,32 @@ def test_counts_vs_theta_figure_renders(processed_loader_factory):
 
 def test_beam_track_figure_bounds_and_inverted_y(processed_loader_factory):
     loader = processed_loader_factory()
-    fig = diagnostics.beam_track_figure(loader, sample="S")
+    extent = diagnostics.trimmed_extent(loader, int(loader.data["fits_index"].iloc[0]))
+    fig = diagnostics.beam_track_figure(
+        loader.data, sample="S", extent=extent, tag="id999_sweep0_E250_P100"
+    )
     ax = fig.axes[0]
     # Axes bounded to the trimmed image; y inverted (image convention).
     ylo, yhi = ax.get_ylim()
     assert ylo > yhi
     xlo, _ = ax.get_xlim()
     assert xlo == 0
+    assert "id999_sweep0_E250_P100" in fig.get_suptitle()
 
 
 def test_save_diagnostics_writes_expected_files(processed_loader_factory, tmp_path):
     loader = processed_loader_factory()
     out = tmp_path / "diag"
     paths = diagnostics.save_diagnostics(loader, out)
-    assert any(p.name == "beam_track.png" for p in paths)
-    assert any(p.name.startswith("counts_vs_theta_") for p in paths)
+    # One RawCounts and one BeamTrack per sweep, sharing the sweep tag.
+    raw = [p for p in paths if p.name.startswith("RawCounts__")]
+    track = [p for p in paths if p.name.startswith("BeamTrack_")]
+    assert raw and track
+    assert {p.name.removeprefix("RawCounts__") for p in raw} == {
+        p.name.removeprefix("BeamTrack_") for p in track
+    }
+    assert all("_sweep" in p.name and p.name.startswith(("RawCounts__id", "BeamTrack_id"))
+               for p in raw + track)
     for p in paths:
         assert p.exists() and p.stat().st_size > 0
 

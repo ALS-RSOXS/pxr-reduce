@@ -21,6 +21,35 @@ from pxr_reduce.run_config import RunConfig, run_config_to_toml_str
 logger = logging.getLogger(__name__)
 
 
+def sample_file_map(config: RunConfig, scan_ids: list[int]) -> dict[Path, int]:
+    """Collect a sample's FITS frames, each mapped to the scan ID it came from.
+
+    The mapping is authoritative — it comes from the ``[samples]`` config rather than
+    being inferred from filenames — so the reduction can key per-scan corrections (the
+    sample-theta offset) and per-point traceability on it.
+
+    Args:
+        config: The run configuration (supplies ``parent_dir``/glob/regex).
+        scan_ids: Scan IDs composing the sample, in the order to concatenate.
+
+    Returns:
+        Mapping of FITS path to scan ID, ordered scan by scan and frame by frame.
+    """
+    files: dict[Path, int] = {}
+    for scan_id in scan_ids:
+        found = find_scan_files(
+            config.parent_dir,
+            scan_id,
+            glob=config.fits_glob,
+            regex=config.scan_number_regex,
+        )
+        if not found:
+            logger.warning("No FITS files found for scan %s.", scan_id)
+        for path in found:
+            files[path] = scan_id
+    return files
+
+
 def sample_files(config: RunConfig, scan_ids: list[int]) -> list[Path]:
     """Collect, in order, every FITS frame for a sample's scans.
 
@@ -31,18 +60,7 @@ def sample_files(config: RunConfig, scan_ids: list[int]) -> list[Path]:
     Returns:
         The pooled FITS paths (scan by scan, frame-ordered within each scan).
     """
-    files: list[Path] = []
-    for scan_id in scan_ids:
-        found = find_scan_files(
-            config.parent_dir,
-            scan_id,
-            glob=config.fits_glob,
-            regex=config.scan_number_regex,
-        )
-        if not found:
-            logger.warning("No FITS files found for scan %s.", scan_id)
-        files.extend(found)
-    return files
+    return list(sample_file_map(config, scan_ids))
 
 
 def plan_batch(
@@ -102,7 +120,8 @@ def reduce_sample(
         FileNotFoundError: If no FITS files are found for the sample.
     """
     scan_ids = config.samples[name]
-    files = sample_files(config, scan_ids)
+    file_map = sample_file_map(config, scan_ids)
+    files = list(file_map)
     if not files:
         raise FileNotFoundError(
             f"No FITS files found for sample {name!r} (scans {scan_ids})."
@@ -111,7 +130,13 @@ def reduce_sample(
 
     # Files are pre-ordered (scan by scan, frame within scan); index by position
     # so several concatenated scans don't need a shared incrementing filename index.
-    loader = PXRLoader(files, config.reduction, index_by_position=True, name=name)
+    loader = PXRLoader(
+        files,
+        config.reduction,
+        index_by_position=True,
+        name=name,
+        scan_ids=file_map,
+    )
     if config.tracker == "simple":
         loader.process(
             search_radius=config.search_radius,
@@ -125,6 +150,7 @@ def reduce_sample(
         loader,
         apply_scale=config.apply_scale,
         drop_duplicates=config.drop_duplicates,
+        duplicate_scope=config.duplicate_scope,
         config_toml=run_config_to_toml_str(config),
     )
     result = dataset.save(

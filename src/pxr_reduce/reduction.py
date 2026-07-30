@@ -55,6 +55,9 @@ logger = logging.getLogger(__name__)
 # Tolerance for comparing pre-rounded metadata values (angles, conditions).
 _FLOAT_EPS = 1e-9
 
+# Granularity at which duplicate points may be averaged together.
+_DUPLICATE_SCOPES: frozenset[str] = frozenset({"sweep", "scan", "angle"})
+
 
 class StitchFitError(RuntimeError):
     """Raised when a stitch scale factor cannot be reliably determined.
@@ -313,13 +316,30 @@ def normalize_scan(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
     (detected via ``sam_z`` motion). Reflectivity ``R = counts_refl / I0`` with
     propagated uncertainty.
 
+    Two distinct sets of frames are marked, because they are not the same set:
+
+    ``is_direct_beam``
+        Sample out of the beam. These and only these form the I0 average.
+    ``i0_mask``
+        Not a reflectivity measurement — the direct-beam frames *plus* any
+        **transition** frames, where ``sam_z`` has already moved the sample in but
+        ``sam_th`` has not started sweeping. Such a frame measures neither the direct
+        beam nor a reflection, so it must be excluded from the output and from stitch
+        overlaps; folding it into the I0 average instead would bias I0, since the
+        sample is already blocking the beam.
+
+    The transition run is found from the *nominal* angle: it is the frames at or after
+    the ``sam_z`` move whose ``sam_th`` still matches the direct-beam angle, within
+    ``config.stitch_theta_backstep`` (the smallest angle change the reduction treats as
+    real).
+
     Args:
         df: One scan group (fresh index).
-        config: Reduction configuration (unused here but kept for signature
-            consistency across stages).
+        config: Reduction configuration (angle tolerance for the transition run).
 
     Returns:
-        The group with ``R``, ``R_err``, and ``i0_mask`` columns added.
+        The group with ``R``, ``R_err``, ``i0_mask``, and ``is_direct_beam`` columns
+        added.
     """
     df = df.copy()
     scan_id = df["fits_index"].iloc[0] if "fits_index" in df else "?"
@@ -342,6 +362,14 @@ def normalize_scan(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
 
     # Direct-beam frames are those strictly before the sample moves into the beam.
     direct = positions < move_position
+    transition = _transition_frames(df, move_position, config)
+    if transition.any():
+        logger.info(
+            "Scan starting at fits_index %s: %d frame(s) have the sample in the beam "
+            "at the un-swept angle; excluded from both I0 and the output.",
+            scan_id,
+            int(transition.sum()),
+        )
     usable = direct & ~saturated
 
     i0, i0_err = 1.0, 0.0
@@ -366,8 +394,41 @@ def normalize_scan(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
         df["counts_refl"] != 0, df["counts_err"] / df["counts_refl"], 0.0
     )
     df["R_err"] = np.abs(df["R"]) * np.sqrt(rel_counts**2 + (i0_err / i0) ** 2)
-    df["i0_mask"] = direct.astype(int)
+    df["is_direct_beam"] = direct.astype(int)
+    df["i0_mask"] = (direct | transition).astype(int)
     return df
+
+
+def _transition_frames(
+    df: pd.DataFrame, move_position: int, config: ReductionConfig
+) -> np.ndarray:
+    """Flag frames where the sample is in the beam but the angle has not moved yet.
+
+    ``sam_z`` moves the sample in one frame before the sweep starts, so the frame at
+    the move still sits at the direct-beam angle. It measures neither I0 nor a
+    reflection, and left alone it becomes a spurious output point at q ~= 0.
+
+    Args:
+        df: One scan group (fresh index).
+        move_position: Positional index of the ``sam_z`` move.
+        config: Reduction configuration (angle tolerance).
+
+    Returns:
+        Boolean mask over the group, True for the transition run.
+    """
+    flags = np.zeros(len(df), dtype=bool)
+    if move_position <= 0 or "sam_th" not in df.columns:
+        return flags
+
+    sam_th = df["sam_th"].to_numpy(dtype=float)
+    # The angle held while the sample was out of the beam.
+    direct_angle = sam_th[move_position - 1]
+    tolerance = config.stitch_theta_backstep
+    for position in range(move_position, len(df)):
+        if abs(sam_th[position] - direct_angle) > tolerance:
+            break
+        flags[position] = True
+    return flags
 
 
 def mark_stitch_points(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
@@ -813,33 +874,67 @@ def apply_scaling(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
 
 
 def finalize(
-    df: pd.DataFrame, config: ReductionConfig, drop_duplicates: bool = True
+    df: pd.DataFrame,
+    config: ReductionConfig,
+    drop_duplicates: bool = True,
+    duplicate_scope: str = "sweep",
 ) -> pd.DataFrame:
     """Select valid reduced points and optionally average duplicates.
 
     Drops direct-beam frames, saturated frames, non-positive reflectivity, and
     (when configured) failed-stitch points.
 
+    ``scan_id`` and ``sweep`` are carried through and, by default, are part of the
+    duplicate key, so every sweep is exported as its own profile. That is the safe
+    default: two sweeps that happen to share an energy and polarization may be
+    deliberate repeats or an accidental duplicate, and nothing can tell them apart
+    automatically — silently averaging them corrupts the result invisibly, while
+    keeping them apart merely yields two visible curves. ``duplicate_scope`` relaxes
+    this when repeats *should* be combined.
+
+    Overlap points re-measured *within* one sweep are always averaged, whatever the
+    scope, since those are the same measurement.
+
     Args:
         df: Fully reduced table.
         config: Reduction configuration (drop-failed policy).
-        drop_duplicates: If True, average points sharing (sam_th, energy,
-            polarization).
+        drop_duplicates: If True, average points sharing the duplicate key.
+        duplicate_scope: Granularity of that key — ``"sweep"`` (default) keeps every
+            sweep separate, ``"scan"`` merges repeat sweeps within a scan, ``"angle"``
+            merges everything sharing (sam_th, energy, polarization).
 
     Returns:
-        Reduced dataset with columns ``scan, energy, polarization, sam_th, q, R,
-        R_err``.
+        Reduced dataset with columns ``scan_id, sweep, energy, polarization, sam_th, q,
+        R, R_err``; identifier columns absent from the input are omitted.
+
+    Raises:
+        ValueError: If ``duplicate_scope`` is not one of the three known values.
     """
+    if duplicate_scope not in _DUPLICATE_SCOPES:
+        raise ValueError(
+            f"duplicate_scope must be one of {sorted(_DUPLICATE_SCOPES)}, "
+            f"got {duplicate_scope!r}"
+        )
+
     mask = df["i0_mask"] < 1
     mask &= ~df["is_saturated"].astype(bool)
     mask &= df["R"] > 0
     if config.drop_failed_stitch:
         mask &= df["failed_stitch_mask"] < 1
 
-    columns = ["scan", "energy", "polarization", "sam_th", "q", "R", "R_err"]
+    identifiers = [c for c in ("scan_id", "sweep") if c in df.columns]
+    keys = ["sam_th", "energy", "polarization"]
+    if duplicate_scope == "sweep":
+        keys = identifiers + keys
+    elif duplicate_scope == "scan":
+        keys = [c for c in identifiers if c == "scan_id"] + keys
+
+    columns = identifiers + ["energy", "polarization", "sam_th", "q", "R", "R_err"]
     out = df.loc[mask, columns]
     if drop_duplicates:
-        out = out.groupby(["sam_th", "energy", "polarization"], as_index=False).mean()
+        # Identifiers not in the key would otherwise be averaged into nonsense.
+        out = out.groupby(keys, as_index=False).mean()
+        out = out[[c for c in columns if c in out.columns]]
     return out.reset_index(drop=True)
 
 
@@ -849,6 +944,7 @@ def reduce(
     *,
     apply_scale: bool = True,
     drop_duplicates: bool = True,
+    duplicate_scope: str = "sweep",
 ) -> pd.DataFrame:
     """Run the full reduction pipeline.
 
@@ -858,7 +954,8 @@ def reduce(
         apply_scale: If False, skip stitch detection and scaling (quick mode) —
             reflectivity is I0-normalized only. Useful for fast previews that
             avoid stitch-overlap pitfalls.
-        drop_duplicates: Average points sharing (sam_th, energy, polarization).
+        drop_duplicates: Average points sharing the duplicate key.
+        duplicate_scope: Granularity of that key; see :func:`finalize`.
 
     Returns:
         The reduced 1D dataset.
@@ -879,7 +976,12 @@ def reduce(
     else:
         df = _init_stitch_columns(df.copy())
 
-    return finalize(df, config, drop_duplicates=drop_duplicates)
+    return finalize(
+        df,
+        config,
+        drop_duplicates=drop_duplicates,
+        duplicate_scope=duplicate_scope,
+    )
 
 
 def annotate(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
@@ -1045,6 +1147,11 @@ def diagnose_stitches(
             rows.append(
                 {
                     "scan": scan_id,
+                    # Stable per-scan identifiers, used to name diagnostic outputs.
+                    "scan_id": (
+                        int(g["scan_id"].iloc[b]) if "scan_id" in g else -1
+                    ),
+                    "sweep": int(g["sweep"].iloc[b]) if "sweep" in g else 0,
                     # Positional index within the scan group; joins this table to
                     # :func:`overlap_report`.
                     "boundary_index": b,

@@ -77,6 +77,101 @@ def test_normalize_scan_excludes_saturated_direct_beam():
     np.testing.assert_allclose(out["R"].to_numpy(), [0.2, 1.0, 0.5, 0.25])
 
 
+def test_transition_frame_is_excluded_from_both_i0_and_output():
+    # Real scans move sam_z in one frame before the sweep starts, so that frame sits at
+    # the direct-beam angle with the sample already in the beam. It is neither I0 nor a
+    # reflection, and unhandled it becomes a spurious output point at q ~= 0.
+    df = _scan_table(
+        sam_th=[0.0, 0.0, 0.0, 1.0, 2.0],
+        sam_z=[0.0, 0.0, 1.0, 1.0, 1.0],
+        counts_refl=[100.0, 100.0, 500.0, 50.0, 25.0],  # frame 2 is not direct beam
+    )
+    out = normalize_scan(df, ReductionConfig())
+
+    # Frames 0,1 form I0; frame 2 is the transition; frames 3,4 are reflectivity.
+    assert out["is_direct_beam"].tolist() == [1, 1, 0, 0, 0]
+    assert out["i0_mask"].tolist() == [1, 1, 1, 0, 0]
+    # I0 = mean(100, 100) = 100 -- the transition frame's 500 counts must not skew it.
+    np.testing.assert_allclose(out["R"].to_numpy(), [1.0, 1.0, 5.0, 0.5, 0.25])
+
+    final = finalize(out.assign(failed_stitch_mask=0), ReductionConfig(),
+                     drop_duplicates=False)
+    assert final["sam_th"].tolist() == [1.0, 2.0]
+
+
+def test_transition_run_stops_at_the_first_real_angle_change():
+    # Only the contiguous run at the direct-beam angle is a transition; a later return
+    # to that angle is a genuine (re-measured) point.
+    df = _scan_table(
+        sam_th=[0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        sam_z=[0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        counts_refl=[100.0, 100.0, 90.0, 90.0, 50.0, 80.0],
+    )
+    out = normalize_scan(df, ReductionConfig())
+    assert out["i0_mask"].tolist() == [1, 1, 1, 1, 0, 0]
+
+
+def test_no_transition_frames_when_the_sweep_starts_immediately():
+    df = _scan_table(
+        sam_th=[0.0, 0.0, 1.0, 2.0],
+        sam_z=[0.0, 0.0, 1.0, 1.0],
+        counts_refl=[100.0, 100.0, 50.0, 25.0],
+    )
+    out = normalize_scan(df, ReductionConfig())
+    assert out["i0_mask"].tolist() == [1, 1, 0, 0]
+    assert out["is_direct_beam"].tolist() == [1, 1, 0, 0]
+
+
+def _duplicate_profiles_table():
+    """Four profiles at one energy/polarization: two sweeps in each of two scans."""
+    df = _scan_table(
+        sam_th=[1.0, 2.0] * 4,
+        sam_z=[1.0] * 8,
+        counts_refl=[10.0, 5.0] * 4,
+    )
+    df["scan_id"] = [11, 11, 11, 11, 22, 22, 22, 22]
+    df["sweep"] = [0, 0, 1, 1, 0, 0, 1, 1]
+    df["R"] = [1.0, 0.5, 1.1, 0.55, 2.0, 1.0, 2.2, 1.1]
+    df["R_err"] = [0.1] * 8
+    df["i0_mask"] = 0
+    df["failed_stitch_mask"] = 0
+    return df
+
+
+def test_finalize_keeps_every_sweep_as_its_own_profile_by_default():
+    # Two sweeps sharing an energy/polarization may be deliberate repeats or an
+    # accidental duplicate; averaging them would hide the accident.
+    out = finalize(_duplicate_profiles_table(), ReductionConfig())
+    assert len(out) == 8
+    assert out[["scan_id", "sweep"]].drop_duplicates().shape[0] == 4
+    assert "scan" not in out.columns
+
+
+def test_finalize_scan_scope_merges_repeat_sweeps_within_a_scan():
+    out = finalize(_duplicate_profiles_table(), ReductionConfig(),
+                   duplicate_scope="scan")
+    # One curve per scan; the two sweeps of each scan are averaged.
+    assert len(out) == 4
+    assert sorted(out["scan_id"].unique()) == [11, 22]
+    merged = out[(out["scan_id"] == 11) & (out["sam_th"] == 1.0)]["R"].iloc[0]
+    assert merged == pytest.approx((1.0 + 1.1) / 2)
+
+
+def test_finalize_angle_scope_merges_everything():
+    out = finalize(_duplicate_profiles_table(), ReductionConfig(),
+                   duplicate_scope="angle")
+    assert len(out) == 2
+    assert out[out["sam_th"] == 1.0]["R"].iloc[0] == pytest.approx(
+        (1.0 + 1.1 + 2.0 + 2.2) / 4
+    )
+
+
+def test_finalize_rejects_an_unknown_duplicate_scope():
+    with pytest.raises(ValueError, match="duplicate_scope must be one of"):
+        finalize(_duplicate_profiles_table(), ReductionConfig(),
+                 duplicate_scope="everything")
+
+
 def test_normalize_scan_no_direct_beam_falls_back():
     df = _scan_table(
         sam_th=[1, 2, 3],
@@ -343,8 +438,10 @@ def _failed_then_good_stitch_scan():
         {
             "fits_index": list(range(11)),
             "scan": [0] * 11,
+            # i0 frames sit at 0.00 so the first reflectivity frame is not a
+            # transition frame; see test_transition_frame_is_excluded for that case.
             "sam_th": [
-                0.10, 0.10, 0.10, 0.20, 0.30, 0.40, 0.50, 0.30, 0.40, 0.50, 0.60
+                0.00, 0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.30, 0.40, 0.50, 0.60
             ],
             "sam_z": [0.0, 0.0] + [1.0] * 9,
             "exposure": [1.0, 1.0, 1.0, 1.0, 5.0, 5.0, 5.0, 9.0, 9.0, 9.0, 9.0],

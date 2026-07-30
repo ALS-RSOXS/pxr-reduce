@@ -54,6 +54,33 @@ HEADER_RESOLUTIONS: dict[str, int] = {
     "slits_horz": 4,
 }
 
+# Columns the loader supplies alongside the raw headers. ``scan_id`` is the ID from
+# ``[samples]`` (or inferred from the filename), and is the unit that per-scan
+# corrections — notably the sample-theta offset — are keyed on.
+DERIVED_COLUMNS: tuple[str, ...] = ("scan_id",)
+
+# Monitor headers that older beamline configurations do not record per frame, with
+# the neutral value substituted when they are absent. Everything else in
+# HEADER_NAMES is required, because the reduction cannot proceed without it.
+#
+# "Beam Current" feeds ``counts_refl = net / (exposure * beam_current)``. A *constant*
+# current cancels exactly in R (which divides by the mean of the direct-beam frames),
+# so substituting 1.0 only loses the correction for ring-current *decay* across a
+# scan. "AI 3 Izero" is sanitized and displayed but never used by the reduction.
+OPTIONAL_HEADERS: dict[str, float] = {
+    "Beam Current": 1.0,
+    "AI 3 Izero": 1.0,
+}
+
+# What the caller loses when an optional monitor header is substituted.
+_OPTIONAL_CONSEQUENCE: dict[str, str] = {
+    "Beam Current": (
+        "Counts are no longer normalized by ring current; a constant current "
+        "cancels in R, but decay across the scan is not corrected."
+    ),
+    "AI 3 Izero": "This column is not used by the reduction (display only).",
+}
+
 # Minimum valid beam current [mA]; below this the monitor is treated as unset.
 _MIN_BEAM_CURRENT = 50.0
 
@@ -94,6 +121,10 @@ def build_metadata_table(
             a ``fits_index`` key and the raw header names in :data:`HEADER_NAMES`.
         config: Reduction configuration (for energy resolution).
 
+    Monitor headers listed in :data:`OPTIONAL_HEADERS` are substituted with a neutral
+    value (and warned about) when the FITS files do not record them, which older
+    beamline configurations do not.
+
     Returns:
         DataFrame with standardized, rounded columns, sorted by ``fits_index``.
 
@@ -102,10 +133,28 @@ def build_metadata_table(
     """
     df = pd.DataFrame(records)
     missing = set(HEADER_NAMES) - set(df.columns)
-    if missing:
-        raise KeyError(f"Records are missing required header keys: {sorted(missing)}")
+    required_missing = missing - set(OPTIONAL_HEADERS)
+    if required_missing:
+        raise KeyError(
+            f"Records are missing required header keys: {sorted(required_missing)}"
+        )
+    for key in sorted(missing):
+        df[key] = OPTIONAL_HEADERS[key]
+        logger.warning(
+            "FITS headers do not record %r; substituting %g. %s",
+            key,
+            OPTIONAL_HEADERS[key],
+            _OPTIONAL_CONSEQUENCE.get(key, ""),
+        )
 
-    df = df[list(HEADER_NAMES)].rename(columns=HEADER_NAMES).round(HEADER_RESOLUTIONS)
+    # Columns the loader derives rather than reads from a header, carried through the
+    # header-name selection below.
+    derived = [c for c in DERIVED_COLUMNS if c in df.columns]
+    df = (
+        df[list(HEADER_NAMES) + derived]
+        .rename(columns=HEADER_NAMES)
+        .round(HEADER_RESOLUTIONS)
+    )
     df["energy"] = round_energy(df["energy"], config.energy_resolution)
     df = df.sort_values("fits_index", ignore_index=True)
     df.insert(1, "scan", 0)
@@ -150,19 +199,109 @@ def clean_monitors(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
 
 
 def label_scans(df: pd.DataFrame, config: ReductionConfig) -> pd.DataFrame:
-    """Assign a scan index to each frame based on large ``sam_th`` jumps.
+    """Split the table into sweeps and number them.
+
+    A sweep boundary is a large ``sam_th`` jump **or** a change of ``scan_id``. The
+    scan-ID rule is the important one: it guarantees that two scans pooled into one
+    sample can never share an I0 or be stitched to each other, whatever their angles.
+    Relying on the angle jump alone is a trap — two scans meeting below
+    ``new_scan_marker`` would silently merge into one sweep and be normalized and
+    stitched as though they were a single measurement.
 
     Args:
-        df: Metadata table.
+        df: Metadata table. ``scan_id`` is used when present.
         config: Reduction configuration (for the new-scan marker threshold).
 
     Returns:
-        A new DataFrame with an integer ``scan`` column.
+        A new DataFrame with an integer ``scan`` column (the internal grouping key,
+        running across the whole table) and ``sweep`` (a 0-based ordinal *within* each
+        scan ID, stable regardless of what else was pooled, used for output and
+        filenames).
     """
     df = df.copy()
     new_scan = df["sam_th"].diff().abs() > config.new_scan_marker
+    if "scan_id" in df.columns:
+        new_scan |= df["scan_id"].ne(df["scan_id"].shift())
+    # The first frame starts sweep 0 rather than ending a previous one.
+    new_scan.iloc[0] = False
     df["scan"] = new_scan.cumsum().astype(int)
+
+    if "scan_id" in df.columns:
+        df["sweep"] = (
+            df.groupby("scan_id")["scan"].rank(method="dense").astype(int) - 1
+        )
+    else:
+        df["sweep"] = df["scan"]
     return df
+
+
+def sweep_tag(
+    scan_id: Any, sweep: Any, energy: float, polarization: float
+) -> str:
+    """Return the identifier used to name per-sweep outputs.
+
+    Every artifact describing one sweep — reduced rows, plots, diagnostic folders —
+    is keyed the same way, so a questionable curve can be traced straight to its
+    files.
+
+    Args:
+        scan_id: The scan ID the sweep belongs to.
+        sweep: 0-based sweep ordinal within that scan.
+        energy: Photon energy of the sweep (eV).
+        polarization: Polarization of the sweep.
+
+    Returns:
+        A string of the form ``id2045_sweep0_E283.5_P100``.
+    """
+    # Identifiers arrive as floats whenever they were read out of a mixed-dtype row
+    # (``frame.iloc[0]`` upcasts), which would render "id2045.0".
+    return (
+        f"id{_as_int(scan_id)}_sweep{_as_int(sweep)}"
+        f"_E{energy:g}_P{polarization:g}"
+    )
+
+
+def _as_int(value: Any) -> Any:
+    """Return ``value`` as an int when it is integral, else unchanged."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def by_sweep(df: pd.DataFrame) -> list[tuple[Any, pd.DataFrame]]:
+    """Group rows by sweep, using the most specific identifier the table carries.
+
+    ``(scan_id, sweep)`` is preferred and is stable across runs; the running ``scan``
+    label is the fallback for tables built before sweeps were numbered.
+
+    Args:
+        df: Any table carrying sweep identifiers.
+
+    Returns:
+        A list of ``(key, group)`` pairs, ordered by key.
+    """
+    for keys in (["scan_id", "sweep"], ["scan"], ["energy", "polarization"]):
+        if all(key in df.columns for key in keys):
+            return list(df.groupby(keys, sort=True))
+    return [((), df)]
+
+
+def sweep_tag_for(group: pd.DataFrame) -> str:
+    """Return :func:`sweep_tag` for one sweep's rows, warning if it is not uniform."""
+    for column in ("energy", "polarization"):
+        if column in group.columns and group[column].nunique() > 1:
+            logger.warning(
+                "Sweep spans %d distinct %s values; naming it after the first.",
+                group[column].nunique(),
+                column,
+            )
+    return sweep_tag(
+        group["scan_id"].iloc[0] if "scan_id" in group.columns else -1,
+        group["sweep"].iloc[0] if "sweep" in group.columns else 0,
+        float(group["energy"].iloc[0]),
+        float(group["polarization"].iloc[0]),
+    )
 
 
 def determine_sam_th_offset(df: pd.DataFrame) -> float:
@@ -182,20 +321,46 @@ def determine_sam_th_offset(df: pd.DataFrame) -> float:
     """
     sam_z_move = df["sam_z"].diff().abs() > 0.0
     sam_z_move.iloc[0] = False
-    move_index = df["sam_z"][sam_z_move].index + 1
-    begin_refl_angle = df["sam_th"].loc[move_index].iloc[0]
-    begin_ccd_angle = df["det_th"].loc[move_index].iloc[0]
+    # Positions of the frames *after* each move. Indexing positionally, and dropping a
+    # move on the final frame, keeps a late sam_z move from running past the end: only
+    # the first move anchors the geometry, but indexing with the whole set would raise.
+    after_move = np.where(sam_z_move.to_numpy())[0] + 1
+    after_move = after_move[after_move < len(df)]
+    if len(after_move) == 0:
+        raise IndexError("No sam_z movement found to anchor the theta-2theta geometry.")
+
+    first = int(after_move[0])
+    begin_refl_angle = df["sam_th"].iloc[first]
+    begin_ccd_angle = df["det_th"].iloc[first]
     return float(np.round(begin_ccd_angle / 2 - begin_refl_angle, 4))
+
+
+def offset_group_column(df: pd.DataFrame) -> str:
+    """Return the column that groups frames sharing one sample-theta offset.
+
+    The offset is an encoder-zero calibration fixed by an alignment, so it belongs to
+    a scan ID: several scans pooled into one sample were aligned separately and do not
+    share it. Falls back to the sweep label when scan IDs are unavailable.
+    """
+    if "scan_id" in df.columns and bool((df["scan_id"] >= 0).all()):
+        return "scan_id"
+    return "scan"
 
 
 def apply_energy_and_theta(
     df: pd.DataFrame, config: ReductionConfig
-) -> tuple[pd.DataFrame, float]:
+) -> tuple[pd.DataFrame, dict[Any, float]]:
     """Apply energy and sample-theta corrections and compute wavelength and q.
 
     Applies the configured energy offset, resolves the sample-theta offset
     (using ``config.sam_th_offset`` when given, otherwise auto-determining it if
     ``config.sam_th_correction`` is set), then derives ``wavelength`` and ``q``.
+
+    The offset is determined and applied **per scan** (see
+    :func:`offset_group_column`). Pooling several scan IDs into one sample and applying
+    a single offset would shift every scan but the first: measured offsets of +0.042 and
+    -0.014 deg for two scans of one sample are typical, and a 0.056 deg error puts their
+    curves on visibly different q grids.
 
     When a header-file override has supplied ``sam_th_actual``/``energy_actual`` (see
     :mod:`pxr_reduce.header_file`), ``q`` is computed from those readbacks while the
@@ -208,33 +373,45 @@ def apply_energy_and_theta(
         config: Reduction configuration.
 
     Returns:
-        A ``(dataframe, sam_th_offset)`` tuple; the offset applied is returned so
-        it can be recorded in the export header.
+        A ``(dataframe, offsets)`` tuple, where ``offsets`` maps each group key (scan
+        ID, or sweep label as a fallback) to the offset applied, for the export header.
     """
     df = df.copy()
     df["energy"] = df["energy"] + config.energy_offset
     if "energy_actual" in df.columns:
         df["energy_actual"] = df["energy_actual"] + config.energy_offset
 
-    sam_th_offset = 0.0
+    group_column = offset_group_column(df)
+    keys = list(df[group_column].unique())
+    offsets: dict[Any, float] = {}
+
     if config.sam_th_offset is not None:
-        sam_th_offset = config.sam_th_offset
+        offsets = {key: float(config.sam_th_offset) for key in keys}
     elif config.sam_th_correction:
-        try:
-            sam_th_offset = determine_sam_th_offset(df)
-            logger.info(
-                "sam_th offset not given; assuming theta-2theta geometry -> "
-                "offset determined to be %.4f deg",
-                sam_th_offset,
-            )
-        except IndexError:
-            logger.warning(
-                "Could not determine sam_th offset (no sam_z move found); using 0.0"
-            )
-            sam_th_offset = 0.0
-    df["sam_th"] = df["sam_th"] + sam_th_offset
+        for key, group in df.groupby(group_column, sort=True):
+            try:
+                offsets[key] = determine_sam_th_offset(group.reset_index(drop=True))
+            except IndexError:
+                logger.warning(
+                    "Could not determine a sam_th offset for %s %s (no sam_z move "
+                    "found); using 0.0",
+                    group_column,
+                    key,
+                )
+                offsets[key] = 0.0
+        logger.info(
+            "sam_th offset not given; assuming theta-2theta geometry -> per-%s "
+            "offset(s): %s",
+            group_column,
+            ", ".join(f"{key}={value:+.4f}" for key, value in sorted(offsets.items())),
+        )
+    else:
+        offsets = {key: 0.0 for key in keys}
+
+    shift = df[group_column].map(offsets).to_numpy(dtype=float)
+    df["sam_th"] = df["sam_th"] + shift
     if "sam_th_actual" in df.columns:
-        df["sam_th_actual"] = df["sam_th_actual"] + sam_th_offset
+        df["sam_th_actual"] = df["sam_th_actual"] + shift
 
     # q reflects where the motors actually were, when that is known.
     theta_column = "sam_th_actual" if "sam_th_actual" in df.columns else "sam_th"
@@ -251,12 +428,12 @@ def apply_energy_and_theta(
     df["q"] = units.theta_to_q(
         np.deg2rad(df[theta_column].to_numpy()), df["wavelength"].to_numpy()
     )
-    return df, sam_th_offset
+    return df, offsets
 
 
 def prepare_metadata(
     df: pd.DataFrame, config: ReductionConfig
-) -> tuple[pd.DataFrame, float]:
+) -> tuple[pd.DataFrame, dict[Any, float]]:
     """Run the full metadata preparation pipeline.
 
     Applies monitor cleanup, scan labeling, and energy/theta/q derivation in the
@@ -267,9 +444,10 @@ def prepare_metadata(
         config: Reduction configuration.
 
     Returns:
-        A ``(prepared_dataframe, sam_th_offset)`` tuple.
+        A ``(prepared_dataframe, offsets)`` tuple; see
+        :func:`apply_energy_and_theta` for the offset mapping.
     """
     df = clean_monitors(df, config)
     df = label_scans(df, config)
-    df, sam_th_offset = apply_energy_and_theta(df, config)
-    return df, sam_th_offset
+    df, offsets = apply_energy_and_theta(df, config)
+    return df, offsets

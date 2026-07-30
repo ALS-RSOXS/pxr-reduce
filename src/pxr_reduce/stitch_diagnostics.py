@@ -39,7 +39,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import LogNorm
 from matplotlib.figure import Figure
 
-from pxr_reduce import image_ops, reduction
+from pxr_reduce import image_ops, metadata, reduction
 
 if TYPE_CHECKING:
     from pxr_reduce.core import PXRLoader
@@ -323,12 +323,20 @@ def _by_scan(boundaries: pd.DataFrame) -> list[tuple[Any, pd.DataFrame]]:
     return list(boundaries.groupby("scan", sort=True))
 
 
-def _scan_dir_name(scan_id: Any) -> str:
-    """Return the per-scan subfolder name for a scan label."""
-    try:
-        return f"scan_{int(scan_id):02d}"
-    except (TypeError, ValueError):
-        return f"scan_{scan_id}"
+def _scan_dir_name(boundaries: pd.DataFrame) -> str:
+    """Return the per-sweep subfolder name from that sweep's boundary rows.
+
+    Uses the same ``id{scan_id}_sweep{n}_E{eV}_P{pol}`` tag as the other per-sweep
+    diagnostics, so a folder, a RawCounts plot and a BeamTrack plot describing one
+    sweep all carry the same name.
+    """
+    row = boundaries.iloc[0]
+    return metadata.sweep_tag(
+        row.get("scan_id", -1),
+        row.get("sweep", 0),
+        float(row["energy"]),
+        float(row["polarization"]),
+    )
 
 
 def _boundary_plot_name(ordinal: int) -> str:
@@ -425,7 +433,7 @@ def summary_lines(
         energies = ", ".join(f"{e:g}" for e in sorted(scan_frames["energy"].unique()))
         lines += [
             "",
-            f"## {_scan_dir_name(scan_id)}",
+            f"## {_scan_dir_name(scan_boundaries)}",
             "",
             f"- **Frames:** {len(scan_frames)} "
             f"(fits_index {int(scan_frames['fits_index'].min())}-"
@@ -725,15 +733,20 @@ def save_stitch_diagnostics(
 
     # Resolve every output name before writing, so the summary can reference them.
     plot_names: dict[Any, str] = {}
-    for scan_id, scan_boundaries in _by_scan(boundaries):
-        scan_name = _scan_dir_name(scan_id)
+    folder_by_scan: dict[Any, str] = {}
+    for scan_label, scan_boundaries in _by_scan(boundaries):
+        scan_name = _scan_dir_name(scan_boundaries)
+        folder_by_scan[scan_label] = scan_name
         for ordinal, pos in enumerate(scan_boundaries.index, start=1):
             plot_names[pos] = f"{scan_name}/{_boundary_plot_name(ordinal)}"
 
     by_index = annotated.set_index("fits_index", drop=False)
     image_names: dict[int, str] = {}
     for idx in _images_to_write(annotated, points, max_images):
-        scan_name = _scan_dir_name(by_index.loc[idx, "scan"])
+        # A saturated frame in a sweep with no boundaries has no folder of its own.
+        scan_name = folder_by_scan.get(
+            by_index.loc[idx, "scan"], metadata.sweep_tag_for(by_index.loc[[idx]])
+        )
         image_names[idx] = f"{scan_name}/saturated/frame_{idx:05d}_roi.png"
 
     written: list[Path] = [directory / "stitch_summary.md"]

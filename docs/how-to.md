@@ -394,6 +394,26 @@ header files contributed, and how many frames were overridden.
   `stitch_summary.md` embeds each figure and names the source `.fits` file for every
   dropped point, plus the ROI image where one was written. Saturated frames that were
   never overlap candidates are listed there too, without images.
+- **Every sweep is its own profile.** A sweep is one theta sweep at one energy and
+  polarization; a scan ID change *always* starts a new sweep, so two pooled scans can
+  never share an I0 or be stitched to each other regardless of their angles. The `.dat`
+  leads with `scan_id` and `sweep` (a 0-based ordinal within the scan), is ordered by
+  energy → polarization → scan_id → sweep → q so each profile is a contiguous block,
+  and by default two sweeps sharing an energy/polarization stay as two curves rather
+  than being averaged. Set `duplicate_scope = "scan"` to merge repeat sweeps within a
+  scan, or `"angle"` for the old merge-everything behaviour.
+- **Per-sweep diagnostics.** `--diagnostics` writes `RawCounts__<tag>.png` and
+  `BeamTrack_<tag>.png` per sweep, and one `stitch/<tag>/` folder per sweep, where
+  `<tag>` is `id{scan_id}_sweep{n}_E{eV}_P{pol}`. The I-vs-q plots use the same tag.
+  The beam track has two panels — the full trimmed frame (so proximity to an edge is
+  judgeable) and a zoom on the path — coloured by frame index, which makes a beam that
+  drifts into an edge once the signal dies immediately obvious.
+- **Transition frames are excluded.** Real scans move `sam_z` in one frame *before* the
+  angle starts sweeping, so that frame has the sample in the beam at the direct-beam
+  angle. It measures neither I0 nor a reflection. It is excluded from both (previously
+  it became a spurious output point at q ≈ 0, which sorted to the top of the file).
+  `is_direct_beam` marks the frames that form I0; `i0_mask` marks everything that is not
+  a reflectivity measurement, which is the larger set.
 - **Saturation is judged on the integrated beam ROI only** — saturation elsewhere on
   the detector does not affect the measured counts and is not flagged. The per-frame
   pixel counts are in the `n_sat_roi` and `n_sat_dark` columns; a non-zero

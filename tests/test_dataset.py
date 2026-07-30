@@ -12,7 +12,7 @@ from pxr_reduce.dataset import (
     _round_value_and_error,
     _stitch_header_lines,
 )
-from pxr_reduce.provenance import ReductionProvenance
+from pxr_reduce.provenance import ReductionProvenance, SourceProvenance
 
 
 def _stitch_report(rows: list[dict]) -> pd.DataFrame:
@@ -92,6 +92,54 @@ def test_from_loader_captures_provenance(dataset):
     assert 250.0 in src.energies
     assert prov.reduction_time  # non-empty ISO string
     assert prov.uncertainty_model
+
+
+def test_dat_is_ordered_by_energy_then_polarization_then_q():
+    data = pd.DataFrame(
+        {
+            "scan_id": [22, 11, 11, 22, 11],
+            "q": [0.03, 0.02, 0.01, 0.01, 0.05],
+            "R": [0.5, 0.6, 0.7, 0.8, 0.9],
+            "R_err": [0.01] * 5,
+            "energy": [284.0, 250.0, 250.0, 284.0, 250.0],
+            "polarization": [100.0, 190.0, 100.0, 100.0, 100.0],
+            "sam_th": [3.0, 2.0, 1.0, 1.0, 5.0],
+        }
+    )
+    body = _make_dataset(data)._ordered_data()
+
+    assert list(body.columns)[0] == "scan_id"
+    assert body["energy"].tolist() == [250.0, 250.0, 250.0, 284.0, 284.0]
+    # Within one energy: polarization ascending, then q ascending.
+    assert body["polarization"].tolist() == [100.0, 100.0, 190.0, 100.0, 100.0]
+    assert body["q"].tolist()[:3] == [0.01, 0.05, 0.02]
+    assert body["q"].tolist()[3:] == [0.01, 0.03]
+    assert "scan" not in body.columns
+
+
+def test_header_reports_per_scan_offsets():
+    prov = ReductionProvenance.create([], reduction_time=None, cwd=Path("."))
+    src = SourceProvenance(
+        sample_name="S", source_path="p", n_frames=1, n_scans=1,
+        energies=[250.0], polarizations=[100.0],
+        sam_th_offsets={2045: -0.014, 6286: 0.042}, config={},
+    )
+    prov.sources.append(src)
+    header = "\n".join(ReducedDataset(data=pd.DataFrame(), provenance=prov).header_lines())
+    assert "per scan [deg]" in header
+    assert "2045: -0.0140" in header
+    assert "6286: +0.0420" in header
+
+
+def test_header_collapses_a_single_shared_offset():
+    src = SourceProvenance(
+        sample_name="S", source_path="p", n_frames=1, n_scans=1,
+        energies=[250.0], polarizations=[100.0],
+        sam_th_offsets={2045: -0.014, 2046: -0.014}, config={},
+    )
+    prov = ReductionProvenance.create([src], reduction_time=None, cwd=Path("."))
+    header = "\n".join(ReducedDataset(data=pd.DataFrame(), provenance=prov).header_lines())
+    assert "sam_th offset  : -0.0140 deg" in header
 
 
 def test_header_lines_contain_key_provenance(dataset):

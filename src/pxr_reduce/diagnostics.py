@@ -3,13 +3,16 @@
 Two extra plots, written into a ``<sample>_diagnostics/`` folder when the CLI is
 run with ``--diagnostics``:
 
-1. **Counts vs theta (pre-scaling)** — one per (energy, polarization). Raw
-   ``counts_spot`` vs ``sam_th`` on a log axis, points coloured by stitch segment
-   so re-measured overlap points are visible, saturated frames marked red, and
-   each stitch boundary annotated with its fitted scale ratio and overlap count.
-2. **Beam track** — one per sample. The beam ``(x, y)`` positions over the whole
-   run, bounded to the trimmed image extent, with a connecting trace per scan and
-   saturated frames highlighted.
+Everything is written per **sweep** and named ``<kind>_id{scan_id}_sweep{n}_E{eV}_P{pol}``,
+so any curve can be traced straight back to its files.
+
+1. **RawCounts** — raw ``counts_spot`` vs ``sam_th`` on a log axis, points coloured by
+   stitch segment so re-measured overlap points are visible, saturated frames marked
+   red, and each stitch boundary annotated with its fitted scale ratio and overlap
+   count.
+2. **BeamTrack** — the beam ``(x, y)`` path for that sweep, bounded to the trimmed
+   image extent, coloured by frame index so the direction of travel is visible and a
+   drifting or jumping beam can be traced to the frames responsible.
 3. **stitch/** — a per-scan breakdown of every stitch boundary: which overlap
    points were used, which were dropped and why, the fit and its quality checks,
    and ROI images of saturated frames that cost an overlap point. See
@@ -31,7 +34,7 @@ from matplotlib import colormaps
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
-from pxr_reduce import reduction, stitch_diagnostics
+from pxr_reduce import metadata, reduction, stitch_diagnostics
 
 if TYPE_CHECKING:
     from pxr_reduce.core import PXRLoader
@@ -113,51 +116,78 @@ def counts_vs_theta_figure(
     return fig
 
 
-def beam_track_figure(loader: PXRLoader, *, sample: str) -> Figure:
-    """Build the beam-spot track diagnostic for a whole sample.
+def beam_track_figure(
+    group: pd.DataFrame, *, sample: str, extent: tuple[int, int], tag: str
+) -> Figure:
+    """Build the beam-spot track diagnostic for **one sweep**.
+
+    One figure per sweep rather than per sample: pooled samples run to thousands of
+    frames across a dozen sweeps, and overlaying them hides which sweep a wandering
+    beam belongs to.
+
+    The trace is drawn in acquisition order and coloured by frame index, so the
+    direction of travel is visible and a beam that jumps or drifts to an edge can be
+    traced to the frames responsible.
 
     Args:
-        loader: A processed :class:`~pxr_reduce.core.PXRLoader`.
+        group: One sweep's rows from the loader table (needs ``beam_spot``,
+            ``fits_index``, ``is_saturated``).
         sample: Sample name for the title.
+        extent: ``(height, width)`` of the trimmed frame, bounding the axes.
+        tag: Sweep identifier for the title.
 
     Returns:
         The rendered :class:`~matplotlib.figure.Figure`.
     """
-    d = loader.data.sort_values("fits_index")
+    d = group.sort_values("fits_index")
     ys = np.array([spot[0] for spot in d["beam_spot"]], dtype=float)
     xs = np.array([spot[1] for spot in d["beam_spot"]], dtype=float)
     saturated = d["is_saturated"].to_numpy(dtype=bool)
-    scans = d["scan"].to_numpy()
+    height, width = extent
 
-    # Axes bounded to the trimmed image extent (where the beam can actually land).
-    first = int(d["fits_index"].iloc[0])
-    height, width = loader.get_clean_image(first).shape[:2]
-
-    fig = Figure(figsize=(6, 6))
+    fig = Figure(figsize=(10.5, 5.2), layout="constrained")
     FigureCanvasAgg(fig)
-    ax = fig.add_subplot(111)
+    full, zoom = fig.subplots(1, 2)
 
-    # One connecting trace per scan (each scan restarts on a condition change).
-    for i, scan_id in enumerate(sorted(set(scans))):
-        mask = scans == scan_id
-        ax.plot(xs[mask], ys[mask], "-", color=_CATEGORICAL(i % 10), lw=1,
-                alpha=0.7, zorder=1, label=f"scan {scan_id}")
+    order = np.arange(len(xs))
+    points = None
+    for ax in (full, zoom):
+        ax.plot(xs, ys, "-", color="0.7", lw=0.8, zorder=1)
+        points = ax.scatter(xs, ys, c=order, cmap="viridis", s=20, zorder=2)
+        if saturated.any():
+            ax.scatter(xs[saturated], ys[saturated], s=52, marker="x", color="red",
+                       zorder=3, label="saturated")
+        if len(xs):
+            ax.plot(xs[0], ys[0], "o", mfc="none", mec="black", ms=12, zorder=4,
+                    label="first frame")
+        ax.set_aspect("equal")
+        ax.set_xlabel("beam x [pix]")
+    full.set_ylabel("beam y [pix]")
+    if points is not None:
+        fig.colorbar(points, ax=zoom, label="frame within sweep", fraction=0.046)
 
-    ax.scatter(xs[~saturated], ys[~saturated], s=16, color="tab:blue",
-               zorder=2, label="beam")
-    if saturated.any():
-        ax.scatter(xs[saturated], ys[saturated], s=36, marker="x", color="red",
-                   zorder=3, label="saturated")
+    # Left: the whole usable frame, so proximity to an edge is judgeable -- a beam
+    # tracked to within half a ROI of one is where counts_spot silently reads low.
+    full.set_xlim(0, width)
+    full.set_ylim(height, 0)  # image convention: row 0 at top
+    full.set_title(f"full trimmed frame ({width}x{height})", fontsize=9)
 
-    ax.set_xlim(0, width)
-    ax.set_ylim(height, 0)  # image convention: row 0 at top
-    ax.set_aspect("equal")
-    ax.set_xlabel("beam x [pix]")
-    ax.set_ylabel("beam y [pix]")
-    ax.set_title(f"{sample}   beam track (trimmed image {width}x{height})")
-    ax.legend(fontsize=7, loc="best")
-    fig.tight_layout()
+    # Right: the path itself. Over one sweep the beam often moves only tens of pixels,
+    # which is a dot at frame scale.
+    if len(xs):
+        pad = max(6.0, 0.15 * max(np.ptp(xs), np.ptp(ys)))
+        zoom.set_xlim(xs.min() - pad, xs.max() + pad)
+        zoom.set_ylim(ys.max() + pad, ys.min() - pad)
+    zoom.set_title("beam path (zoomed)", fontsize=9)
+    zoom.legend(fontsize=7, loc="best")
+
+    fig.suptitle(f"{sample}   {tag}   beam track", fontsize=10)
     return fig
+
+
+def trimmed_extent(loader: PXRLoader, fits_index: int) -> tuple[int, int]:
+    """Return the ``(height, width)`` of a trimmed frame, for bounding plot axes."""
+    return loader.get_clean_image(fits_index).shape[:2]
 
 
 def save_diagnostics(
@@ -188,27 +218,30 @@ def save_diagnostics(
     annotated = reduction.annotate(loader.data, loader.config)
     written: list[Path] = []
 
-    for (energy, pol), group in annotated.groupby(
-        ["energy", "polarization"], sort=True
-    ):
-        target = directory / f"counts_vs_theta_E{energy:g}eV_P{pol:g}.png"
-        written.append(target)
-        if dry_run:
-            logger.info("[dry-run] Would write %s", target)
-            continue
-        directory.mkdir(parents=True, exist_ok=True)
-        fig = counts_vs_theta_figure(
-            group, sample=sample, energy=float(energy), pol=float(pol)
-        )
-        fig.savefig(target, dpi=150)
-        logger.info("Wrote %s", target)
+    for _, group in metadata.by_sweep(annotated):
+        tag = metadata.sweep_tag_for(group)
+        energy = float(group["energy"].iloc[0])
+        pol = float(group["polarization"].iloc[0])
 
-    target = directory / "beam_track.png"
-    written.append(target)
-    if not dry_run:
+        counts_target = directory / f"RawCounts__{tag}.png"
+        track_target = directory / f"BeamTrack_{tag}.png"
+        written += [counts_target, track_target]
+        if dry_run:
+            logger.info("[dry-run] Would write %s", counts_target)
+            logger.info("[dry-run] Would write %s", track_target)
+            continue
+
         directory.mkdir(parents=True, exist_ok=True)
-        beam_track_figure(loader, sample=sample).savefig(target, dpi=150)
-        logger.info("Wrote %s", target)
+        counts_vs_theta_figure(
+            group, sample=sample, energy=energy, pol=pol
+        ).savefig(counts_target, dpi=150)
+        logger.info("Wrote %s", counts_target)
+
+        extent = trimmed_extent(loader, int(group["fits_index"].iloc[0]))
+        beam_track_figure(
+            group, sample=sample, extent=extent, tag=tag
+        ).savefig(track_target, dpi=150)
+        logger.info("Wrote %s", track_target)
 
     written += stitch_diagnostics.save_stitch_diagnostics(
         loader, directory / "stitch", dry_run=dry_run

@@ -21,6 +21,8 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from uncertainties.formatting import PDG_precision
 
+from pxr_reduce import metadata
+from pxr_reduce.metadata import by_sweep as _by_sweep
 from pxr_reduce.provenance import (
     ReductionProvenance,
     SourceProvenance,
@@ -34,17 +36,26 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Output column order and units for the .dat file.
-_DAT_COLUMNS = ["q", "R", "R_err", "energy", "polarization", "sam_th", "scan"]
+# Output column order and units for the .dat file. ``scan_id`` and ``sweep`` lead so
+# every point is traceable to the sweep that produced it; the internal running ``scan``
+# label is not exported, because its value depends on what else was pooled.
+_DAT_COLUMNS = [
+    "scan_id", "sweep", "q", "R", "R_err", "energy", "polarization", "sam_th",
+]
 _COLUMN_UNITS = {
+    "scan_id": "-",
+    "sweep": "-",
     "q": "A^-1",
     "R": "arb",
     "R_err": "arb",
     "energy": "eV",
     "polarization": "deg_or_pct",
     "sam_th": "deg",
-    "scan": "-",
 }
+
+# Export sort order: all of one energy together, then polarization, and each sweep as an
+# unbroken block along q so a profile can be split out downstream without regrouping.
+_SORT_COLUMNS = ["energy", "polarization", "scan_id", "sweep", "q"]
 
 # Decimal places to which sample-theta is trusted; also sets the assumed angular
 # step (10^-N deg) used to propagate an uncertainty onto q for export rounding.
@@ -170,6 +181,7 @@ class ReducedDataset:
         reduced: pd.DataFrame | None = None,
         apply_scale: bool = True,
         drop_duplicates: bool = True,
+        duplicate_scope: str = "sweep",
         reduction_time: datetime | None = None,
         config_toml: str | None = None,
     ) -> ReducedDataset:
@@ -181,6 +193,8 @@ class ReducedDataset:
                 called with the given options.
             apply_scale: Passed to ``loader.reduce`` when ``reduced`` is None.
             drop_duplicates: Passed to ``loader.reduce`` when ``reduced`` is None.
+            duplicate_scope: Passed to ``loader.reduce``; see
+                :func:`pxr_reduce.reduction.finalize`.
             reduction_time: Timestamp to record; defaults to now.
             config_toml: Full run-config TOML to embed in the header; defaults to a
                 ``[reduction]`` table built from the loader's config.
@@ -190,7 +204,9 @@ class ReducedDataset:
         """
         if reduced is None:
             reduced = loader.reduce(
-                apply_scale=apply_scale, drop_duplicates=drop_duplicates
+                apply_scale=apply_scale,
+                drop_duplicates=drop_duplicates,
+                duplicate_scope=duplicate_scope,
             )
         source = build_source_provenance(loader, reduced)
         provenance = ReductionProvenance.create(
@@ -299,8 +315,11 @@ class ReducedDataset:
     # -- Writing --------------------------------------------------------------
 
     def _ordered_data(self) -> pd.DataFrame:
+        """Return the export columns, sorted by energy, then polarization, then q."""
         cols = [c for c in _DAT_COLUMNS if c in self.data.columns]
-        return self.data[cols]
+        keys = [c for c in _SORT_COLUMNS if c in self.data.columns]
+        data = self.data.sort_values(keys) if keys else self.data
+        return data[cols].reset_index(drop=True)
 
     def _formatted_body(self, angle_decimals: int = _ANGLE_DECIMALS) -> pd.DataFrame:
         """Return the export table with q/R/R_err/sam_th rounded for output.
@@ -377,7 +396,11 @@ class ReducedDataset:
         return path
 
     def save_plots(self, directory: Path | str, *, dry_run: bool = False) -> list[Path]:
-        """Write one I-vs-q PNG per (energy, polarization) group.
+        """Write one I-vs-q PNG per sweep.
+
+        One file per sweep rather than per (energy, polarization): two sweeps sharing
+        an energy and polarization are separate profiles, and overlaying them in a
+        single figure would present an accidental duplicate as one curve.
 
         Args:
             directory: Folder to write PNGs into (created if needed).
@@ -388,10 +411,10 @@ class ReducedDataset:
         """
         directory = Path(directory)
         written: list[Path] = []
-        groups = self.data.groupby(["energy", "polarization"], sort=True)
-        for (energy, pol), group in groups:
-            fname = f"IvsQ_E{energy:g}eV_P{pol:g}.png"
-            target = directory / fname
+        for _, group in _by_sweep(self.data):
+            energy = float(group["energy"].iloc[0])
+            pol = float(group["polarization"].iloc[0])
+            target = directory / f"IvsQ_{metadata.sweep_tag_for(group)}.png"
             written.append(target)
             if dry_run:
                 logger.info("[dry-run] Would write plot %s", target)
@@ -431,6 +454,22 @@ class ReducedDataset:
             plot_dir = path.parent / f"{path.stem}_plots"
             plot_paths = self.save_plots(plot_dir, dry_run=dry_run)
         return {"dat": dat_path, "plots": plot_paths}
+
+
+def _format_offsets(offsets: dict[Any, float]) -> str:
+    """Render the per-scan sample-theta offsets for the export header.
+
+    Collapses to a single value when every scan agrees, so the common case stays
+    readable, but names each scan when they differ — which they do whenever scans
+    aligned at different times are pooled into one sample.
+    """
+    if not offsets:
+        return "none applied"
+    values = set(offsets.values())
+    if len(values) == 1:
+        return f"{next(iter(values)):+.4f} deg"
+    per_scan = ", ".join(f"{key}: {value:+.4f}" for key, value in sorted(offsets.items()))
+    return f"per scan [deg] {per_scan}"
 
 
 def _stitch_header_lines(report: pd.DataFrame | None) -> list[str]:
@@ -498,9 +537,14 @@ def _source_header_lines(index: int, src: SourceProvenance) -> list[str]:
         f"Collected      : {src.collection_time_start} .. {src.collection_time_end}",
         f"Energies [eV]  : {energies}",
         f"Polarizations  : {pols}",
-        f"sam_th offset  : {src.sam_th_offset} deg",
+        f"sam_th offset  : {_format_offsets(src.sam_th_offsets)}",
         f"Detector       : {detector_name}{noise_note}",
     ]
+    if src.substituted_headers:
+        lines.append(
+            "Monitors       : NOT recorded in the FITS headers, neutral value "
+            f"substituted: {', '.join(src.substituted_headers)}"
+        )
     if src.header_override:
         # Records that the per-frame metadata did not come from the FITS files.
         lines += [
@@ -508,6 +552,11 @@ def _source_header_lines(index: int, src: SourceProvenance) -> list[str]:
             f"  {src.header_override}",
             "  nominal (Goal) values drive corrections; q uses the readback (Actual)",
         ]
+        if src.n_frames_dropped:
+            lines.append(
+                f"  WARNING: {src.n_frames_dropped} frame(s) had no header row and "
+                "were excluded from this reduction"
+            )
     return lines
 
 

@@ -84,6 +84,9 @@ class OverrideReport:
         sources: Header files that contributed, by name.
         n_unused_rows: Header rows with no matching loaded frame (normal when only
             part of a scan is loaded, e.g. under ``--subsample``).
+        n_dropped_frames: Loaded frames with no header row, which were dropped from
+            the reduction.
+        dropped_frames: Filenames of those dropped frames.
     """
 
     directory: Path
@@ -91,13 +94,20 @@ class OverrideReport:
     columns: tuple[str, ...]
     sources: tuple[str, ...]
     n_unused_rows: int
+    n_dropped_frames: int = 0
+    dropped_frames: tuple[str, ...] = ()
 
     def describe(self) -> str:
         """Return a one-line human-readable summary."""
-        return (
+        text = (
             f"{self.n_frames} frame(s) overridden from {len(self.sources)} header "
             f"file(s) in {self.directory}; columns: {', '.join(self.columns)}"
         )
+        if self.n_dropped_frames:
+            text += (
+                f"; {self.n_dropped_frames} frame(s) dropped for having no header row"
+            )
+        return text
 
 
 def _fits_key(field: str) -> str:
@@ -289,13 +299,13 @@ def apply_override(
     Returns:
         A ``(table, report)`` tuple. For each overridden motor the canonical column
         holds the ``Goal`` value, ``<column>_actual`` the readback, and
-        ``<column>_fits`` the original FITS value.
+        ``<column>_fits`` the original FITS value. Frames with no header row are
+        dropped from the table — their motor positions were never logged, so they
+        cannot be placed on the q axis — and counted in the report.
 
     Raises:
-        ValueError: If ``config.header`` is unset, no loaded frame can be matched, or
-            any loaded frame has no header row. A partial override would leave some
-            frames on the faulty metadata and others corrected, which is worse than
-            either alone.
+        ValueError: If ``config.header`` is unset, no loaded frame can be matched at
+            all, or the header files record none of the reduction's motors.
         NotADirectoryError: If ``config.header`` is not a directory.
     """
     if config.header is None:
@@ -305,18 +315,37 @@ def apply_override(
     index = index_header_directory(directory)
 
     keys = [_fits_key(filenames[int(i)]) for i in table["fits_index"]]
-    missing = [
-        filenames[int(i)] for i, key in zip(table["fits_index"], keys) if key not in index
+    matched = [key in index for key in keys]
+    dropped = [
+        filenames[int(i)]
+        for i, ok in zip(table["fits_index"], matched, strict=True)
+        if not ok
     ]
-    if missing:
-        shown = ", ".join(missing[:_MAX_REPORTED])
-        more = "" if len(missing) <= _MAX_REPORTED else f" (+{len(missing) - _MAX_REPORTED} more)"
+    if dropped:
+        shown = ", ".join(dropped[:_MAX_REPORTED])
+        more = (
+            ""
+            if len(dropped) <= _MAX_REPORTED
+            else f" (+{len(dropped) - _MAX_REPORTED} more)"
+        )
+        logger.warning(
+            "%d of %d loaded frame(s) have no row in any header file under %s and are "
+            "dropped from the reduction: %s%s",
+            len(dropped),
+            len(keys),
+            directory,
+            shown,
+            more,
+        )
+    if not any(matched):
         raise ValueError(
-            f"{len(missing)} of {len(keys)} loaded frame(s) have no row in any header "
-            f"file under {directory}: {shown}{more}. Refusing to override only part of "
-            "the scan."
+            f"None of the {len(keys)} loaded frame(s) have a row in any header file "
+            f"under {directory}. Check that reduction.header points at the right "
+            "directory for this data."
         )
 
+    table = table.loc[pd.Series(matched, index=table.index)].reset_index(drop=True)
+    keys = [key for key, ok in zip(keys, matched, strict=True) if ok]
     rows = [index[key] for key in keys]
     # Only override motors present for every matched frame.
     common = set.intersection(*(set(row.values) for row in rows))
@@ -327,7 +356,6 @@ def apply_override(
             "the reduction's metadata columns; nothing would be overridden."
         )
 
-    table = table.copy()
     for raw, canonical in sorted(motors.items(), key=lambda kv: kv[1]):
         goal = pd.Series(
             [row.values[f"{raw} {_GOAL}"] for row in rows], index=table.index
@@ -346,6 +374,8 @@ def apply_override(
         columns=tuple(sorted(motors.values())),
         sources=tuple(sorted({row.source.name for row in rows})),
         n_unused_rows=len(index) - len(set(keys)),
+        n_dropped_frames=len(dropped),
+        dropped_frames=tuple(dropped),
     )
     logger.info("Header override: %s", report.describe())
     return table, report

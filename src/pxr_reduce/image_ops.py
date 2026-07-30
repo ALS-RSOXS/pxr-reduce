@@ -49,6 +49,9 @@ class FrameIntegration:
         n_sat_dark: Saturated pixel count in the dark ROI. Reported for diagnostics
             only — it never sets ``is_saturated``, but a non-zero value means the
             background estimate is clipped and ``counts_ratio`` is unreliable.
+        n_roi_pixels: Pixels actually summed into ``counts_spot``. Below
+            ``roi_height * roi_width`` the ROI was clipped by the frame edge and the
+            counts read low; zero means it fell off entirely.
     """
 
     beam_spot: tuple[int, int]
@@ -59,6 +62,7 @@ class FrameIntegration:
     is_saturated: bool
     n_sat_roi: int = 0
     n_sat_dark: int = 0
+    n_roi_pixels: int = 0
 
 
 def trim(image: NDArray[np.floating], trim_x: int, trim_y: int) -> NDArray[np.floating]:
@@ -344,18 +348,12 @@ def integrate_at(
     """
     spot = image[roi_slices(beam_spot, config)]
     dark = image[dark_roi_slices(beam_spot, config)]
-    if spot.size < config.roi_height * config.roi_width:
-        # roi_slices does not clamp to the image bounds, so a beam within half a ROI
-        # of an edge yields a clipped (possibly empty) slice and counts_spot is not
-        # the configured integration. Worth knowing about: it means the beam was
-        # tracked to the edge of the usable frame.
-        logger.warning(
-            "Beam ROI at %s is clipped by the frame edge (%d of %d px); counts_spot "
-            "is integrated over less than the configured ROI.",
-            beam_spot,
-            spot.size,
-            config.roi_height * config.roi_width,
-        )
+    # roi_slices does not clamp to the image bounds, so a beam within half a ROI of an
+    # edge yields a clipped (possibly empty) slice. The size is reported rather than
+    # warned about here: this runs per frame, and ``image`` may be the tracker's
+    # cropped search region, so it knows neither the frame index nor the frame-relative
+    # beam position needed to make a warning actionable. See
+    # :meth:`~pxr_reduce.core.PXRLoader._assemble_counts`.
     counts_spot = float(spot.sum())
     counts_dark = float(dark.sum())
     # net_counts sums spot and dark independently, so unequal ROI shapes (e.g. a
@@ -372,4 +370,5 @@ def integrate_at(
         is_saturated=detector.is_saturated(spot, threshold),
         n_sat_roi=detector.count_saturated(spot, threshold),
         n_sat_dark=detector.count_saturated(dark, threshold),
+        n_roi_pixels=int(spot.size),
     )

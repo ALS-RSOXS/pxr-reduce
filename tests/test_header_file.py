@@ -232,13 +232,35 @@ def test_apply_override_replaces_goal_keeps_actual_and_fits(header_dir):
     assert report.sources == ("scan.txt",)
 
 
-def test_apply_override_refuses_a_partial_match(header_dir):
+def test_apply_override_drops_frames_with_no_header_row(header_dir, caplog):
+    # Header logs routinely omit a few frames. Those frames have no logged motor
+    # position, so they are dropped and counted rather than left on faulty metadata.
     directory, make = header_dir
     make("scan.txt", [("S_000.fits", _GOALS, {})])
     header_file.index_header_directory.cache_clear()
     config = ReductionConfig(header=directory)
 
-    with pytest.raises(ValueError, match="no row in any header file"):
+    with caplog.at_level("WARNING"):
+        out, report = header_file.apply_override(
+            _fits_table(2), {0: "S_000.fits", 1: "S_001.fits"}, config
+        )
+
+    assert len(out) == 1
+    assert out["fits_index"].tolist() == [0]
+    assert report.n_frames == 1
+    assert report.n_dropped_frames == 1
+    assert report.dropped_frames == ("S_001.fits",)
+    assert "dropped from the reduction" in caplog.text
+    assert "dropped for having no header row" in report.describe()
+
+
+def test_apply_override_raises_when_nothing_matches(header_dir):
+    directory, make = header_dir
+    make("scan.txt", [("OTHER_000.fits", _GOALS, {})])
+    header_file.index_header_directory.cache_clear()
+    config = ReductionConfig(header=directory)
+
+    with pytest.raises(ValueError, match="None of the"):
         header_file.apply_override(
             _fits_table(2), {0: "S_000.fits", 1: "S_001.fits"}, config
         )
